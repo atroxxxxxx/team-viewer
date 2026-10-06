@@ -1,0 +1,52 @@
+@startuml 01-ticket-and-publish
+title 01. Заявка и публикация потока
+skinparam defaultFontName DejaVu Sans
+skinparam sequenceMessageAlign left
+autonumber
+
+actor "Клиент" as User
+participant "Клиентское приложение" as App
+participant "Nginx" as Edge
+participant "Сервис заявок" as Tickets
+database "PostgreSQL" as DB
+collections "Redis" as Cache
+participant "Ретранслятор RTSP" as Relay
+
+User -> App : Описание проблемы, флаг камеры
+note over App
+  config.yaml: адрес заявок, адрес RTSP,
+  логин client и пароль.
+  account_id хранится локально.
+end note
+App -> Edge : POST /api/v1/tickets\nBasic client
+Edge -> Tickets : тот же запрос на 18080
+Tickets -> DB : INSERT в секцию tickets_sN\nstatus=created, chat_member client
+note over DB
+  shard_id = crc32(account_id) % 4.
+  Все секции пока local в shard_directory.
+end note
+Tickets -> DB : INSERT media_grant publisher\nscreen, опционально camera
+Tickets -> Cache : SET media:token:{sha256}\nHSET ticket:{id}
+Tickets -> App : ticket_id, publisher_token, пути
+
+App -> Relay : TCP :8554, RTSP ANNOUNCE + RECORD\n/sessions/{id}/screen?token=...\nRTP interleaved
+note over App, Relay
+  Исходящее соединение.
+  Новый порт на сессию не открывается.
+  UDP для RTP не слушается.
+end note
+Relay -> Cache : Проверка хеша токена, роль publisher
+Relay -> App : 200 OK, путь screen жив
+
+opt Камера включена клиентом
+  App -> Relay : Второе TCP, RTSP RECORD\n/sessions/{id}/camera?token=...
+  Relay -> App : 200 OK, путь camera жив
+end
+
+App -> Edge : POST /tickets/{id}/media\nBasic client, X-Ticket-Token
+Edge -> Tickets : screen=up
+Tickets -> DB : status=queued
+Tickets -> Cache : presence client,\nPUBLISH queue:tickets
+Tickets -> App : Заявка в очереди
+App -> User : Экран ретранслируется
+@enduml

@@ -1,0 +1,106 @@
+{
+  "openapi": "3.0.3",
+  "info": {
+    "title": "Сервис заявок",
+    "version": "0.1.0"
+  },
+  "paths": {
+    "/health": {
+      "get": {
+        "summary": "Проверка процесса и Redis",
+        "responses": {"200": {"description": "ok"}}
+      }
+    },
+    "/api/v1/tickets": {
+      "post": {
+        "summary": "Создать заявку и токен издателя",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": ["account_id", "description"],
+                "properties": {
+                  "account_id": {"type": "string", "format": "uuid"},
+                  "description": {"type": "string"},
+                  "camera": {"type": "boolean"}
+                }
+              }
+            }
+          }
+        },
+        "responses": {"201": {"description": "заявка создана"}}
+      },
+      "get": {
+        "summary": "Очередь заявок со статусом queued",
+        "responses": {"200": {"description": "список"}}
+      }
+    },
+    "/api/v1/tickets/{id}": {
+      "get": {
+        "summary": "Прочитать заявку",
+        "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}}],
+        "responses": {"200": {"description": "заявка"}, "404": {"description": "нет заявки"}}
+      }
+    },
+    "/api/v1/tickets/{id}/media": {
+      "post": {
+        "summary": "Сообщить, что экран публикуется, и поставить заявку в очередь",
+        "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}}],
+        "requestBody": {
+          "required": true,
+          "content": {"application/json": {"schema": {"type": "object", "properties": {"screen": {"type": "string"}, "camera": {"type": "string"}}}}}
+        },
+        "responses": {"200": {"description": "queued"}}
+      }
+    },
+    "/api/v1/tickets/{id}/claim": {
+      "post": {
+        "summary": "Захватить заявку и получить токен читателя",
+        "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}}],
+        "requestBody": {
+          "required": true,
+          "content": {"application/json": {"schema": {"type": "object", "required": ["operator_id"], "properties": {"operator_id": {"type": "string", "format": "uuid"}}}}}
+        },
+        "responses": {"200": {"description": "захват выполнен"}, "409": {"description": "уже занята"}}
+      }
+    },
+    "/api/v1/tickets/{id}/session": {
+      "get": {"summary": "Чат, план, грант, ожидающий ввод и подтверждения", "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}}], "responses": {"200": {"description": "снимок сессии"}}}
+    },
+    "/api/v1/tickets/{id}/messages": {
+      "post": {"summary": "Сообщение чата", "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}}], "responses": {"201": {"description": "отправлено"}}}
+    },
+    "/api/v1/tickets/{id}/control-requests": {
+      "post": {"summary": "Запросить управление", "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}}], "responses": {"201": {"description": "грант pending"}}}
+    },
+    "/api/v1/tickets/{id}/control-requests/{grant}/decision": {
+      "post": {"summary": "Ответ клиента на управление", "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}}, {"name": "grant", "in": "path", "required": true, "schema": {"type": "string"}}], "responses": {"200": {"description": "решение записано"}}}
+    },
+    "/api/v1/tickets/{id}/input": {
+      "post": {"summary": "Событие ввода после валидатора оператора", "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}}], "responses": {"201": {"description": "proposed"}}}
+    },
+    "/api/v1/tickets/{id}/input/{action}/result": {
+      "post": {"summary": "Результат валидатора клиента", "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}}, {"name": "action", "in": "path", "required": true, "schema": {"type": "string"}}], "responses": {"200": {"description": "фаза обновлена"}}}
+    },
+    "/api/v1/tickets/{id}/actions": {
+      "post": {"summary": "Записать отказ правил, не исполняя действие", "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}}], "responses": {"201": {"description": "blocked_by_policy"}}}
+    },
+    "/api/v1/tickets/{id}/plans": {
+      "post": {"summary": "План шагов", "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}}], "responses": {"201": {"description": "план создан"}}}
+    },
+    "/api/v1/tickets/{id}/steps/{step}/observations": {
+      "post": {"summary": "Наблюдение клиента по шагу", "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}}, {"name": "step", "in": "path", "required": true, "schema": {"type": "string"}}], "responses": {"201": {"description": "записано"}}}
+    },
+    "/api/v1/tickets/{id}/steps/{step}/complete": {
+      "post": {"summary": "Отметить шаг после наблюдения", "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}}, {"name": "step", "in": "path", "required": true, "schema": {"type": "string"}}], "responses": {"200": {"description": "done"}}}
+    },
+    "/api/v1/tickets/{id}/problems": {
+      "post": {"summary": "Дочерняя проблема и вложенный план", "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}}], "responses": {"201": {"description": "проблема создана"}}}
+    },
+    "/api/v1/tickets/{id}/resolution": {
+      "post": {"summary": "Подтверждение решения клиентом или оператором", "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}}], "responses": {"200": {"description": "статус сессии"}}}
+    }
+  }
+}

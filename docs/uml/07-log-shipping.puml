@@ -1,0 +1,30 @@
+@startuml 07-log-shipping
+title 07. Журналы в ELK\nСПЕЦПОМЕТКА: пунктир не входит в поставку
+skinparam defaultFontName DejaVu Sans
+skinparam sequenceMessageAlign left
+autonumber
+
+participant "Сервис заявок" as Tickets
+participant "Ретранслятор RTSP" as Relay
+database "PostgreSQL" as DB
+participant "Logstash" as Logstash
+database "Elasticsearch" as Elastic
+participant "Kibana" as Kibana
+
+Tickets -> Tickets : JSON-строка в stdout
+Relay -> Relay : JSON-строка в stdout
+Tickets -> DB : INSERT action_log\nжурнал заявки, не ELK
+
+note over Logstash, Kibana
+  СПЕЦПОМЕТКА.
+  ELK не входит в поставку.
+  Ниже только целевой будущий поток.
+  action_log для разбора заявок
+  и будущего обучения сюда не копируется.
+end note
+
+Tickets --> Logstash : Сбор stdout
+Relay --> Logstash : Сбор stdout
+Logstash --> Elastic : Индекс support-logs
+Elastic --> Kibana : Поиск и разбор
+@enduml

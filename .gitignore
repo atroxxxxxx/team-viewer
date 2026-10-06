@@ -1,0 +1,13 @@
+/safety-policy/
+/training-log/
+
+.env
+*.exe
+*.test
+/ticket-service/ticket
+/relay-service/relay
+*.log
+__pycache__/
+.venv/
+.state/
+*.pyc

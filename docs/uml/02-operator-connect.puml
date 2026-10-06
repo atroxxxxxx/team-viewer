@@ -1,0 +1,57 @@
+@startuml 02-operator-connect
+title 02. Подключение оператора и туннель
+skinparam defaultFontName DejaVu Sans
+skinparam sequenceMessageAlign left
+autonumber
+
+actor "Оператор" as Operator
+participant "Приложение оператора" as App
+participant "Nginx" as Edge
+participant "Сервис заявок" as Tickets
+database "PostgreSQL" as DB
+collections "Redis" as Cache
+participant "Ретранслятор RTSP" as Relay
+
+note over App
+  config.yaml: логин operator.
+  Идентификатор оператора считает сервис,
+  тело запроса его не задаёт.
+end note
+App -> Edge : GET /api/v1/tickets\nBasic operator
+Edge -> Tickets : очередь
+Tickets -> DB : SELECT status=queued
+Tickets -> App : Список с описанием
+
+App -> Edge : POST /tickets/{id}/claim\nBasic operator
+Edge -> Tickets : захват
+Tickets -> Cache : SETNX lock:ticket:{id}
+
+alt Заявка уже занята
+  Tickets -> App : 409 Conflict
+else Блокировка получена
+  Tickets -> DB : status=assigned,\nassignee=id оператора
+  Tickets -> DB : INSERT reader grant
+  Tickets -> Cache : SET media:token читателя,\nSADD presence operator
+  Tickets -> DB : INSERT chat_member operator
+  Tickets -> App : reader_token, пути
+
+  App -> Relay : TCP :8554, RTSP DESCRIBE + PLAY\n/sessions/{id}/screen?token=reader
+  note over Relay
+    RECORD клиента и PLAY оператора
+    склеены на одном порту.
+    Без reader-токена DESCRIBE получает 401.
+  end note
+  Relay -> Cache : Проверка хеша, роль reader
+  Relay -> App : RTP экрана interleaved
+
+  opt В заявке есть камера
+    App -> Relay : RTSP PLAY /sessions/{id}/camera
+    Relay -> App : RTP камеры
+  end
+
+  loop Раз в секунду
+    App -> Tickets : GET /tickets/{id}/session
+    Tickets -> App : Описание, чат, план, грант
+  end
+end
+@enduml

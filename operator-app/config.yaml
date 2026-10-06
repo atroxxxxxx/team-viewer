@@ -1,0 +1,11 @@
+ticket:
+  host: 127.0.0.1
+  port: 443
+  scheme: https
+  tls_verify: false
+relay:
+  host: 127.0.0.1
+  port: 8554
+auth:
+  username: operator
+  password: "czixyK5esSuS2d990aicwQ-ruCSXt5Xp"
