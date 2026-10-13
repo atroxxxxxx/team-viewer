@@ -39,3 +39,25 @@ def play_args(url: str) -> list[str]:
         ffmpeg_path(), "-loglevel", "error", "-rtsp_transport", "tcp", "-i", url,
         "-vf", f"scale={FRAME_WIDTH}:{FRAME_HEIGHT}", "-f", "rawvideo", "-pix_fmt", "rgb24", "-",
     ]
+
+
+def media_action(active_tunnel: str, wanted_tunnel: str, status: str) -> str:
+    """Что сделать с публикацией клиента: stop, start, keep или idle."""
+    if status == "resolved":
+        return "stop" if active_tunnel else "idle"
+    if wanted_tunnel and wanted_tunnel != active_tunnel:
+        return "start"
+    if active_tunnel and not wanted_tunnel:
+        return "stop"
+    if active_tunnel:
+        return "keep"
+    return "idle"
+
+
+def should_open_player(playing_tunnel: str, wanted_tunnel: str, running: bool, status: str) -> bool:
+    """Оператор открывает плеер, пока заявка жива, а поток ещё не идёт."""
+    if status == "resolved" or not wanted_tunnel:
+        return False
+    if playing_tunnel != wanted_tunnel:
+        return True
+    return not running

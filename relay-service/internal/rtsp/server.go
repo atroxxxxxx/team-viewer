@@ -4,6 +4,7 @@ import (
 	"context"
 	"net"
 	"sync"
+	"time"
 
 	"relay-service/internal/logx"
 	"relay-service/internal/session"
@@ -74,12 +75,33 @@ func (s *Server) OnDescribe(ctx *gortsplib.ServerHandlerOnDescribeCtx) (*base.Re
 	if err := s.allow(ctx.Conn.NetConn(), ctx.Path); err != nil {
 		return &base.Response{StatusCode: base.StatusUnauthorized}, nil, nil
 	}
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	if stream, ok := s.streams[ctx.Path]; ok {
-		return &base.Response{StatusCode: base.StatusOK}, stream, nil
+	// Оператор подключается сразу после захвата, клиент публикует экран чуть позже.
+	stream, ok := waitFor(15*time.Second, 200*time.Millisecond, func() (*gortsplib.ServerStream, bool) {
+		s.mu.RLock()
+		defer s.mu.RUnlock()
+		stream, found := s.streams[ctx.Path]
+		return stream, found
+	})
+	if !ok {
+		logx.Info("rtsp describe missing", map[string]any{"path": ctx.Path})
+		return &base.Response{StatusCode: base.StatusNotFound}, nil, nil
 	}
-	return &base.Response{StatusCode: base.StatusNotFound}, nil, nil
+	logx.Info("rtsp describe", map[string]any{"path": ctx.Path})
+	return &base.Response{StatusCode: base.StatusOK}, stream, nil
+}
+
+func waitFor[T any](timeout, step time.Duration, lookup func() (T, bool)) (T, bool) {
+	var zero T
+	deadline := time.Now().Add(timeout)
+	for {
+		if value, ok := lookup(); ok {
+			return value, true
+		}
+		if !time.Now().Before(deadline) {
+			return zero, false
+		}
+		time.Sleep(step)
+	}
 }
 
 func (s *Server) OnAnnounce(ctx *gortsplib.ServerHandlerOnAnnounceCtx) (*base.Response, error) {

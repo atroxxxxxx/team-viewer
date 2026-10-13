@@ -79,7 +79,15 @@ func (s *Store) DeleteByTicket(ctx context.Context, ticketID string) error {
 	if err != nil {
 		return s.rdb.Del(ctx, "ticket:"+ticketID, "tunnel:"+tunnelID).Err()
 	}
-	return s.rdb.Del(ctx, "ticket:"+ticketID, "tunnel:"+tunnelID, "client:"+item.ClientID).Err()
+	// client: хранит последний туннель этого клиента. Закрытие старой заявки не должно стереть новый.
+	_, err = s.rdb.Eval(ctx, `
+		redis.call("DEL", KEYS[1], KEYS[2])
+		if redis.call("GET", KEYS[3]) == ARGV[1] then
+			redis.call("DEL", KEYS[3])
+		end
+		return 1
+	`, []string{"ticket:" + ticketID, "tunnel:" + tunnelID, "client:" + item.ClientID}, tunnelID).Result()
+	return err
 }
 
 func (s *Store) AllowPath(ctx context.Context, path string) error {

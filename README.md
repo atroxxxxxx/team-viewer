@@ -8,7 +8,7 @@
 
 | Папка | Что это |
 | --- | --- |
-| [ticket-service](ticket-service/README.md) | Сервис заявок, Go, Gin |
+| [ticket-service](ticket-service/README.md) | Сервис заявок, Python, SQLAlchemy |
 | [relay-service](relay-service/README.md) | Ретранслятор, Go и Redis |
 | [postgres-redis](postgres-redis/README.md) | PostgreSQL сервиса заявок |
 | [nginx/nginx.conf](nginx/nginx.conf) | Вход с localhost и HTTPS Let's Encrypt |
@@ -22,6 +22,10 @@
 | [TODO.md](TODO.md) | Планы и известные ошибки |
 
 Правила команд и журнал обучения по-прежнему только в описании и в git не входят. См. `.gitignore`.
+
+## Зависимости Go
+
+Перед сборкой образа ретранслятора в `relay-service` рекомендуется выполнить `go mod vendor`. Образ собирается из каталога `vendor` и не скачивает модули снаружи. Каталог `vendor` в git не входит: на GitHub уходят `go.mod` и `go.sum`, а сами исходники зависимостей остаются на машине, где собирается образ. После смены зависимостей `go mod vendor` запускают снова. Сервис заявок написан на Python, его зависимости ставятся при сборке образа.
 
 ## Прототип
 

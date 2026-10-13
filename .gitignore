@@ -11,4 +11,5 @@ __pycache__/
 .venv/
 .state/
 /operator-app/models/
+vendor/
 *.pyc

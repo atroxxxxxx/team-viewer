@@ -57,6 +57,12 @@ services:
       CLIENT_PASSWORD: ${CLIENT_PASSWORD:-Yuvr4_U4n4uKy5eois-o55Z5reI6pKFT}
       OPERATOR_USER: operator
       OPERATOR_PASSWORD: ${OPERATOR_PASSWORD:-czixyK5esSuS2d990aicwQ-ruCSXt5Xp}
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:18080/health')"]
+      interval: 2s
+      timeout: 3s
+      retries: 40
+      start_period: 5s
     depends_on:
       certs:
         condition: service_completed_successfully
@@ -89,7 +95,7 @@ services:
       certs:
         condition: service_completed_successfully
       ticket:
-        condition: service_started
+        condition: service_healthy
 
 volumes:
   letsencrypt:

@@ -13,7 +13,7 @@ RTSP слушает только `127.0.0.1:18554` внутри процесса
 
 `GET /health` на порту `18082` проверяет Redis.
 
-Отдельный запуск: `docker compose -f relay-service/docker-compose.yaml up -d --build`.
+Отдельный запуск: `docker compose -f relay-service/docker-compose.yaml up -d --build`. Перед сборкой образа рекомендуется `go mod vendor` в этом каталоге: Docker берёт зависимости из `vendor` и не ходит за ними в сеть.
 
 ## Связи
 

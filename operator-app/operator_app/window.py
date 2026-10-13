@@ -19,7 +19,7 @@ from PySide6.QtWidgets import (
 from operator_app.agent import next_action
 from support_protocol.api import TicketAPI
 from support_protocol.endpoints import config_file, load_endpoints
-from support_protocol.media import FRAME_HEIGHT, FRAME_WIDTH, play_args
+from support_protocol.media import FRAME_HEIGHT, FRAME_WIDTH, play_args, should_open_player
 from support_protocol.policy import intent_allowed, validate_input, validate_step
 from support_protocol.tunnel import LocalRTSPBridge
 
@@ -40,6 +40,8 @@ class OperatorWindow(QWidget):
         self.relay_port = relay_port
         self.operator_id = _load_id(STATE)
         self.ticket_id = ""
+        self.playing_tunnel = ""
+        self.play_gen = 0
         self.bridge: LocalRTSPBridge | None = None
         self.session: dict = {}
         self.player: QProcess | None = None
@@ -148,24 +150,58 @@ class OperatorWindow(QWidget):
             return
         self.ticket_id = ticket_id
         self.status.setText(f"Заявка {ticket_id} захвачена")
-        self._play(claimed["account_id"], claimed["tunnel_id"])
+        self._sync_player(claimed["account_id"], claimed["tunnel_id"], "assigned")
 
-    def _play(self, account_id: str, tunnel_id: str) -> None:
+    def _sync_player(self, account_id: str, tunnel_id: str, status: str) -> None:
+        if status == "resolved" or not tunnel_id:
+            self._stop_play()
+            return
+        running = self.player is not None and self.player.state() != QProcess.ProcessState.NotRunning
+        if account_id and should_open_player(self.playing_tunnel, tunnel_id, running, status):
+            self._play(account_id, tunnel_id)
+
+    def _stop_play(self) -> None:
+        if self.player is None and self.bridge is None and not self.playing_tunnel:
+            return
+        self.play_gen += 1
+        self.playing_tunnel = ""
         if self.player is not None:
-            self.player.terminate()
+            self.player.kill()
+            self.player = None
         if self.bridge is not None:
             self.bridge.close()
+            self.bridge = None
+
+    def _play(self, account_id: str, tunnel_id: str) -> None:
+        self._stop_play()
+        gen = self.play_gen
+        self.playing_tunnel = tunnel_id
         self.bridge = LocalRTSPBridge(self.relay_host, self.relay_port, "OPERATOR", account_id)
         url = self.bridge.url(f"/tunnels/{tunnel_id}/screen")
         try:
             args = play_args(url)
         except RuntimeError as exc:
+            self._stop_play()
             self.status.setText(str(exc))
             return
         self.buffer.clear()
+        self.preview.setText("Жду экран клиента")
         self.player = QProcess(self)
         self.player.readyReadStandardOutput.connect(self._read_frame)
+        self.player.finished.connect(lambda *_args, g=gen: self._player_finished(g))
         self.player.start(args[0], args[1:])
+
+    def _player_finished(self, gen: int) -> None:
+        if gen != self.play_gen or self.player is None:
+            return
+        err = bytes(self.player.readAllStandardError()).decode("utf-8", errors="replace").strip()
+        self.player = None
+        self.playing_tunnel = ""
+        if self.bridge is not None:
+            self.bridge.close()
+            self.bridge = None
+        if err:
+            self.preview.setText(err.splitlines()[-1][:180])
 
     def _read_frame(self) -> None:
         if self.player is None:
@@ -188,15 +224,13 @@ class OperatorWindow(QWidget):
             self.status.setText(str(exc))
             return
         ticket = self.session.get("ticket") or {}
+        self._sync_player(ticket.get("account_id") or "", ticket.get("tunnel_id") or "", ticket.get("status") or "")
         self.status.setText(f"{ticket.get('status', '')} · {self.ticket_id}")
         lines = [f"{item.get('author')}: {item.get('body')}" for item in self.session.get("messages") or []]
         self.chat.setPlainText("\n".join(lines))
         self.steps.clear()
         for step in self.session.get("steps") or []:
             self.steps.addItem(f"{step.get('status')} {step.get('id')} {step.get('body')}")
-        if ticket.get("status") == "resolved" and self.player is not None:
-            self.player.terminate()
-            self.player = None
 
     def preview_click(self, event) -> None:
         if not self.ticket_id:
@@ -348,8 +382,7 @@ class OperatorWindow(QWidget):
             self.status.setText(str(exc))
 
     def closeEvent(self, event) -> None:
-        if self.player is not None:
-            self.player.terminate()
+        self._stop_play()
         super().closeEvent(event)
 
 
