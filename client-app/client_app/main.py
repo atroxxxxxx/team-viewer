@@ -1,7 +1,9 @@
 import sys
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "support-protocol"))
+_protocol = Path(__file__).resolve().parents[2] / "support-protocol"
+if _protocol.is_dir():
+    sys.path.insert(0, str(_protocol))
 
 from PySide6.QtWidgets import QApplication
 

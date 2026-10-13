@@ -7,8 +7,8 @@ import (
 	"time"
 
 	"ticket-service/internal/auth"
-	"ticket-service/internal/cache"
 	"ticket-service/internal/logx"
+	"ticket-service/internal/relayclient"
 	"ticket-service/internal/store"
 
 	"github.com/gin-gonic/gin"
@@ -18,23 +18,19 @@ import (
 
 type Server struct {
 	store      *store.Store
-	cache      *cache.Cache
+	relay      *relayclient.Client
 	creds      auth.Checker
 	shardCount int
-	tokenTTL   time.Duration
-	lockTTL    time.Duration
 	swaggerDoc string
 	spec       []byte
 }
 
-func New(st *store.Store, ca *cache.Cache, creds auth.Checker, shardCount int, spec []byte, swaggerDoc string) *Server {
+func New(st *store.Store, relay *relayclient.Client, creds auth.Checker, shardCount int, spec []byte, swaggerDoc string) *Server {
 	return &Server{
 		store:      st,
-		cache:      ca,
+		relay:      relay,
 		creds:      creds,
 		shardCount: shardCount,
-		tokenTTL:   12 * time.Hour,
-		lockTTL:    8 * time.Hour,
 		swaggerDoc: swaggerDoc,
 		spec:       spec,
 	}
@@ -53,7 +49,6 @@ func (s *Server) Router() *gin.Engine {
 	api.POST("/tickets", s.only(auth.RoleClient), s.createTicket)
 	api.GET("/tickets", s.only(auth.RoleOperator), s.listTickets)
 	api.GET("/tickets/:id", s.reader(), s.getTicket)
-	api.POST("/tickets/:id/media", s.clientToken(), s.mediaUp)
 	api.POST("/tickets/:id/claim", s.only(auth.RoleOperator), s.claim)
 	api.GET("/tickets/:id/session", s.reader(), s.getSession)
 	api.POST("/tickets/:id/messages", s.participant(), s.postMessage)
@@ -77,9 +72,8 @@ func limitBody(c *gin.Context) {
 }
 
 func (s *Server) health(c *gin.Context) {
-	ctx := c.Request.Context()
-	if err := s.cache.Ping(ctx); err != nil {
-		c.JSON(http.StatusServiceUnavailable, gin.H{"status": "redis down"})
+	if err := s.store.Ping(c.Request.Context()); err != nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"status": "postgres down"})
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{"status": "ok"})

@@ -8,9 +8,9 @@ import (
 	"time"
 
 	"ticket-service/internal/auth"
-	"ticket-service/internal/cache"
 	"ticket-service/internal/httpapi"
 	"ticket-service/internal/logx"
+	"ticket-service/internal/relayclient"
 	"ticket-service/internal/store"
 )
 
@@ -28,7 +28,7 @@ func main() {
 		logx.Error("shard count", map[string]any{"config": shardCount})
 		os.Exit(1)
 	}
-	st, ca := waitDeps(env("DATABASE_URL", "postgres://support:support@127.0.0.1:5432/support?sslmode=disable"), env("REDIS_ADDR", "127.0.0.1:6379"), shardCount)
+	st := waitDB(env("DATABASE_URL", "postgres://support:support@127.0.0.1:5432/support?sslmode=disable"), shardCount)
 	defer st.Close()
 
 	spec, err := specFS.ReadFile("openapi.json")
@@ -36,7 +36,8 @@ func main() {
 		logx.Error("openapi", map[string]any{"err": err.Error()})
 		os.Exit(1)
 	}
-	srv := httpapi.New(st, ca, creds, shardCount, spec, env("SWAGGER_DOC_URL", "/swagger/doc.json"))
+	relay := relayclient.New(env("RELAY_INGEST_URL", "http://127.0.0.1:18082"), env("RELAY_INGEST_TOKEN", ""))
+	srv := httpapi.New(st, relay, creds, shardCount, spec, env("SWAGGER_DOC_URL", "/swagger/doc.json"))
 	addr := env("HTTP_ADDR", "127.0.0.1:18080")
 	logx.Info("listen", map[string]any{"addr": addr})
 	if err := srv.Router().Run(addr); err != nil {
@@ -45,7 +46,7 @@ func main() {
 	}
 }
 
-func waitDeps(dsn, redisAddr string, shardCount int) (*store.Store, *cache.Cache) {
+func waitDB(dsn string, shardCount int) *store.Store {
 	deadline := time.Now().Add(60 * time.Second)
 	var last error
 	for {
@@ -54,17 +55,13 @@ func waitDeps(dsn, redisAddr string, shardCount int) (*store.Store, *cache.Cache
 		if err == nil {
 			local, countErr := st.LocalShardCount(ctx)
 			if countErr == nil && local == shardCount {
-				ca := cache.Open(redisAddr)
-				pingErr := ca.Ping(ctx)
-				if pingErr == nil {
-					cancel()
-					return st, ca
-				}
-				last = pingErr
-			} else if countErr != nil {
+				cancel()
+				return st
+			}
+			if countErr != nil {
 				last = countErr
 			} else {
-				last = errShard(local, shardCount)
+				last = shardMismatch{local, shardCount}
 			}
 			st.Close()
 		} else {
@@ -81,8 +78,6 @@ func waitDeps(dsn, redisAddr string, shardCount int) (*store.Store, *cache.Cache
 }
 
 type shardMismatch struct{ local, config int }
-
-func errShard(local, config int) error { return shardMismatch{local, config} }
 
 func (e shardMismatch) Error() string {
 	return "shard count mismatch"

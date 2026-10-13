@@ -4,8 +4,8 @@ from pathlib import Path
 from PySide6.QtCore import QBuffer, QIODevice, QProcess, Qt, QTimer
 from PySide6.QtGui import QImage, QPixmap
 from PySide6.QtWidgets import (
+    QApplication,
     QCheckBox,
-    QFormLayout,
     QHBoxLayout,
     QLabel,
     QLineEdit,
@@ -17,26 +17,30 @@ from PySide6.QtWidgets import (
 )
 
 from operator_app.agent import next_action
-from support_protocol.api import TicketAPI, media_url
-from support_protocol.endpoints import load_endpoints
+from support_protocol.api import TicketAPI
+from support_protocol.endpoints import config_file, load_endpoints
 from support_protocol.media import FRAME_HEIGHT, FRAME_WIDTH, play_args
 from support_protocol.policy import intent_allowed, validate_input, validate_step
+from support_protocol.tunnel import LocalRTSPBridge
 
 ROOT = Path(__file__).resolve().parents[1]
 STATE = ROOT / ".state" / "operator_id"
 
 
 class OperatorWindow(QWidget):
-    def __init__(self):
+    def __init__(self, models: dict | None = None):
         super().__init__()
+        self.models = models
         self.setWindowTitle("Оператор техподдержки")
-        api_base, rtsp_base, username, password, tls_verify = load_endpoints(ROOT / "config.yaml")
+        api_base, relay_host, relay_port, username, password, tls_verify = load_endpoints(
+            config_file(ROOT / "config.yaml", "SUPPORT_OPERATOR_CONFIG")
+        )
         self.api = TicketAPI(api_base, username, password, verify=tls_verify)
+        self.relay_host = relay_host
+        self.relay_port = relay_port
         self.operator_id = _load_id(STATE)
         self.ticket_id = ""
-        self.reader_token = ""
-        self.rtsp_base = rtsp_base
-        self.screen_path = ""
+        self.bridge: LocalRTSPBridge | None = None
         self.session: dict = {}
         self.player: QProcess | None = None
         self.buffer = bytearray()
@@ -62,10 +66,14 @@ class OperatorWindow(QWidget):
         self.plan_text.setPlaceholderText("По одному шагу на строку")
         self.problem = QLineEdit()
         self.problem.setPlaceholderText("Что сломал этот шаг")
-        self.endpoint = QLineEdit("http://127.0.0.1:11434")
-        self.planner = QLineEdit("qwen2.5:7b")
-        self.vision = QLineEdit("qwen2.5vl:7b")
         self.allow_model_input = QCheckBox("Модель может предлагать ввод")
+        if self.models is None:
+            self.model_note = QLabel("Режим человека: модели не скачиваются и шаг модели выключен")
+        else:
+            self.model_note = QLabel(
+                "Профиль {profile}: текст {text_repo}, кадр {vision_repo}, решение {decision_repo}. {reason}".format(**self.models)
+            )
+        self.model_note.setWordWrap(True)
         self.text_input = QLineEdit()
         self.text_input.setPlaceholderText("Текст в поле программы клиента")
         refresh = QPushButton("Обновить очередь")
@@ -84,14 +92,12 @@ class OperatorWindow(QWidget):
         nested.clicked.connect(self.add_problem)
         close = QPushButton("Предложить закрытие")
         close.clicked.connect(lambda: self.resolve(True))
-        model = QPushButton("Шаг модели")
-        model.clicked.connect(self.model_step)
+        self.model_button = QPushButton("Шаг модели")
+        self.model_button.clicked.connect(self.model_step)
+        self.model_button.setEnabled(self.models is not None)
+        self.allow_model_input.setEnabled(self.models is not None)
         typed = QPushButton("Отправить текст")
         typed.clicked.connect(self.send_text)
-        form = QFormLayout()
-        form.addRow("Ollama", self.endpoint)
-        form.addRow("План", self.planner)
-        form.addRow("Кадр", self.vision)
         layout = QVBoxLayout(self)
         layout.addWidget(refresh)
         layout.addWidget(self.queue)
@@ -112,9 +118,9 @@ class OperatorWindow(QWidget):
         layout.addWidget(nested)
         layout.addWidget(self.text_input)
         layout.addWidget(typed)
-        layout.addLayout(form)
+        layout.addWidget(self.model_note)
         layout.addWidget(self.allow_model_input)
-        layout.addWidget(model)
+        layout.addWidget(self.model_button)
         layout.addWidget(close)
         self.resize(720, 980)
 
@@ -136,21 +142,21 @@ class OperatorWindow(QWidget):
             return
         ticket_id = item.text().split()[0]
         try:
-            claimed = self.api.claim(ticket_id, self.operator_id)
+            claimed = self.api.claim(ticket_id)
         except RuntimeError as exc:
             self.status.setText(str(exc))
             return
         self.ticket_id = ticket_id
-        self.reader_token = claimed["reader_token"]
-        paths = claimed.get("paths") or []
-        self.screen_path = paths[0] if paths else ""
         self.status.setText(f"Заявка {ticket_id} захвачена")
-        self._play()
+        self._play(claimed["account_id"], claimed["tunnel_id"])
 
-    def _play(self) -> None:
+    def _play(self, account_id: str, tunnel_id: str) -> None:
         if self.player is not None:
             self.player.terminate()
-        url = media_url(self.rtsp_base, self.screen_path, self.reader_token)
+        if self.bridge is not None:
+            self.bridge.close()
+        self.bridge = LocalRTSPBridge(self.relay_host, self.relay_port, "OPERATOR", account_id)
+        url = self.bridge.url(f"/tunnels/{tunnel_id}/screen")
         try:
             args = play_args(url)
         except RuntimeError as exc:
@@ -263,7 +269,7 @@ class OperatorWindow(QWidget):
         self._guarded(lambda: self.api.resolve(self.ticket_id, "operator", accept, "Предлагаю закрыть заявку"))
 
     def model_step(self) -> None:
-        if not self.ticket_id:
+        if not self.ticket_id or self.models is None:
             return
         context = {
             "description": (self.session.get("ticket") or {}).get("description", ""),
@@ -272,8 +278,13 @@ class OperatorWindow(QWidget):
             "steps": self.session.get("steps") or [],
             "control": self.session.get("control") or {},
         }
+
+        def progress(text: str) -> None:
+            self.status.setText(text)
+            QApplication.processEvents()
+
         try:
-            action = next_action(self.endpoint.text(), self.planner.text(), self.vision.text(), context, self._png())
+            action = next_action(self.models, context, self._png(), progress)
         except Exception as exc:
             self.status.setText(f"Модель недоступна: {exc}")
             return

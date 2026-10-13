@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "remote-support-desktop"
+version = "0.1.0"
+description = "Клиент и оператор удалённой техподдержки"
+requires-python = ">=3.11"
+
+[tool.setuptools]
+packages = ["support_protocol", "client_app", "operator_app"]
+
+[tool.setuptools.package-dir]
+support_protocol = "support-protocol/support_protocol"
+client_app = "client-app/client_app"
+operator_app = "operator-app/operator_app"

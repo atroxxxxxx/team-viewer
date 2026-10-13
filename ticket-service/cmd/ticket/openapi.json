@@ -7,13 +7,13 @@
   "paths": {
     "/health": {
       "get": {
-        "summary": "Проверка процесса и Redis",
+        "summary": "Проверка процесса и PostgreSQL",
         "responses": {"200": {"description": "ok"}}
       }
     },
     "/api/v1/tickets": {
       "post": {
-        "summary": "Создать заявку и токен издателя",
+        "summary": "Создать заявку с описанием проблемы",
         "requestBody": {
           "required": true,
           "content": {
@@ -44,26 +44,11 @@
         "responses": {"200": {"description": "заявка"}, "404": {"description": "нет заявки"}}
       }
     },
-    "/api/v1/tickets/{id}/media": {
-      "post": {
-        "summary": "Сообщить, что экран публикуется, и поставить заявку в очередь",
-        "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}}],
-        "requestBody": {
-          "required": true,
-          "content": {"application/json": {"schema": {"type": "object", "properties": {"screen": {"type": "string"}, "camera": {"type": "string"}}}}}
-        },
-        "responses": {"200": {"description": "queued"}}
-      }
-    },
     "/api/v1/tickets/{id}/claim": {
       "post": {
-        "summary": "Захватить заявку и получить токен читателя",
+        "summary": "Утвердить заявку и положить туннель в ретранслятор",
         "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}}],
-        "requestBody": {
-          "required": true,
-          "content": {"application/json": {"schema": {"type": "object", "required": ["operator_id"], "properties": {"operator_id": {"type": "string", "format": "uuid"}}}}}
-        },
-        "responses": {"200": {"description": "захват выполнен"}, "409": {"description": "уже занята"}}
+        "responses": {"200": {"description": "туннель создан"}, "409": {"description": "уже занята"}, "502": {"description": "ретранслятор недоступен"}}
       }
     },
     "/api/v1/tickets/{id}/session": {

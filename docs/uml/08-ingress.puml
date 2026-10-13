@@ -1,55 +1,33 @@
 @startuml 08-ingress
-title 08. Вход: сертификаты, nginx, учётные записи
+title 08. Два сервера и порты ретранслятора
 skinparam defaultFontName DejaVu Sans
 skinparam sequenceMessageAlign left
 autonumber
 
-participant "Контейнер certs" as Certs
-participant "Let's Encrypt" as LE
-participant "Nginx" as Edge
 participant "Сервис заявок" as Tickets
+database "PostgreSQL" as DB
 participant "Ретранслятор" as Relay
-actor "Браузер" as Browser
+collections "Redis" as Cache
+actor "Клиент" as Client
+actor "Оператор" as Operator
 
-alt В .env заданы два DNS-имени
-  Certs -> LE : HTTP-01 на порту 80\nTICKET_DOMAIN и RELAY_DOMAIN
-  LE -> Certs : Сертификаты
-  Certs -> Edge : tls.conf для обоих имён
-else .env пуст или DNS не подтверждён
-  Certs -> Edge : локальный сертификат\nтолько 127.0.0.1:443
-end
-note over Certs, Edge
-  Контейнер certs завершается
-  до старта заявок, ретранслятора и nginx.
-  Пустой .env не останавливает стек.
+Tickets -> DB : Заявки, чат, планы, журнал
+note over Tickets, Relay
+  Сервисы могут стоять на разных машинах.
+  У заявок нет Redis. У ретранслятора нет PostgreSQL.
 end note
 
-alt Сертификат есть
-  Browser -> Edge : http://127.0.0.1:8080/
-  Edge -> Browser : 301 https://127.0.0.1/
-  Browser -> Edge : https://127.0.0.1/
-  Edge -> Browser : 302 /swagger/tickets/
-  opt Let's Encrypt подтвердил имена
-    Browser -> Edge : http://TICKET_DOMAIN/
-    Edge -> Browser : 301 https://TICKET_DOMAIN/
-  end
-else Сертификата нет
-  Browser -> Edge : http://127.0.0.1:8080/
-  Edge -> Browser : 302 /swagger/tickets/
-end
+Tickets -> Relay : Порт 18082, приём утверждённой заявки
+Relay -> Cache : uuid клиента и tunnel_id, 15 минут
 
-Browser -> Edge : http://другой-адрес:8080/
-Edge -> Browser : Соединение закрыто без ответа
+Client -> Relay : Порт 8554, CLIENT uuid
+Operator -> Relay : Порт 8554, OPERATOR uuid
+Relay -> Relay : RTSP только на 127.0.0.1
 
-Browser -> Edge : https://TICKET_DOMAIN/api/
-Edge -> Tickets : 127.0.0.1:18080
-Tickets -> Edge : Ответ API
-Edge -> Browser : HTTPS
-
-Browser -> Edge : https://RELAY_DOMAIN/api/
-Edge -> Relay : 127.0.0.1:18081\nтолько Basic operator для /api/v1/paths
-Relay -> Edge : Ответ API
-
-Browser -> Edge : https://имя/
-Edge -> Browser : Соединение закрыто без ответа
+note over Client, Operator
+  Пока у nginx заявок есть сертификат,
+  HTTP перенаправляет на HTTPS.
+  Если сертификата нет, API заявок идёт по HTTP.
+  Сессионный порт ретранслятора — всегда TCP, не страница.
+end note
 @enduml

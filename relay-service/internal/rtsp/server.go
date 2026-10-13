@@ -2,11 +2,11 @@ package rtsp
 
 import (
 	"context"
-	"net/url"
+	"net"
 	"sync"
 
 	"relay-service/internal/logx"
-	"relay-service/internal/token"
+	"relay-service/internal/session"
 
 	"github.com/bluenviron/gortsplib/v4"
 	"github.com/bluenviron/gortsplib/v4/pkg/base"
@@ -16,23 +16,22 @@ import (
 	"github.com/pion/rtp"
 )
 
-// Server принимает публикацию и чтение на одном RTSP-порту.
-// UDP-порты не открываются: RTP едет внутри RTSP.
+// Server принимает RTSP только с localhost. Снаружи к нему ходят через session.Bridge.
 type Server struct {
-	addr    string
-	tokens  *token.Checker
-	server  *gortsplib.Server
-	mu      sync.RWMutex
-	streams map[string]*gortsplib.ServerStream
-	pubs    map[string]*gortsplib.ServerSession
+	addr     string
+	sessions *session.Store
+	server   *gortsplib.Server
+	mu       sync.RWMutex
+	streams  map[string]*gortsplib.ServerStream
+	pubs     map[string]*gortsplib.ServerSession
 }
 
-func New(addr string, tokens *token.Checker) *Server {
+func New(addr string, sessions *session.Store) *Server {
 	s := &Server{
-		addr:    addr,
-		tokens:  tokens,
-		streams: make(map[string]*gortsplib.ServerStream),
-		pubs:    make(map[string]*gortsplib.ServerSession),
+		addr:     addr,
+		sessions: sessions,
+		streams:  make(map[string]*gortsplib.ServerStream),
+		pubs:     make(map[string]*gortsplib.ServerSession),
 	}
 	s.server = &gortsplib.Server{
 		Handler:     s,
@@ -47,16 +46,6 @@ func (s *Server) Start() error {
 
 func (s *Server) Close() {
 	s.server.Close()
-}
-
-func (s *Server) Paths() []string {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	out := make([]string, 0, len(s.streams))
-	for path := range s.streams {
-		out = append(out, path)
-	}
-	return out
 }
 
 func (s *Server) OnConnOpen(*gortsplib.ServerHandlerOnConnOpenCtx) {}
@@ -82,7 +71,7 @@ func (s *Server) OnSessionClose(ctx *gortsplib.ServerHandlerOnSessionCloseCtx) {
 }
 
 func (s *Server) OnDescribe(ctx *gortsplib.ServerHandlerOnDescribeCtx) (*base.Response, *gortsplib.ServerStream, error) {
-	if err := s.tokens.Allow(context.Background(), queryToken(ctx.Query), "reader", ctx.Path); err != nil {
+	if err := s.allow(ctx.Conn.NetConn(), ctx.Path); err != nil {
 		return &base.Response{StatusCode: base.StatusUnauthorized}, nil, nil
 	}
 	s.mu.RLock()
@@ -94,7 +83,7 @@ func (s *Server) OnDescribe(ctx *gortsplib.ServerHandlerOnDescribeCtx) (*base.Re
 }
 
 func (s *Server) OnAnnounce(ctx *gortsplib.ServerHandlerOnAnnounceCtx) (*base.Response, error) {
-	if err := s.tokens.Allow(context.Background(), queryToken(ctx.Query), "publisher", ctx.Path); err != nil {
+	if err := s.allow(ctx.Conn.NetConn(), ctx.Path); err != nil {
 		return &base.Response{StatusCode: base.StatusUnauthorized}, nil
 	}
 	s.mu.Lock()
@@ -119,7 +108,7 @@ func (s *Server) OnSetup(ctx *gortsplib.ServerHandlerOnSetupCtx) (*base.Response
 	if ctx.Session.State() == gortsplib.ServerSessionStatePreRecord {
 		return &base.Response{StatusCode: base.StatusOK}, nil, nil
 	}
-	if err := s.tokens.Allow(context.Background(), queryToken(ctx.Query), "reader", ctx.Path); err != nil {
+	if err := s.allow(ctx.Conn.NetConn(), ctx.Path); err != nil {
 		return &base.Response{StatusCode: base.StatusUnauthorized}, nil, nil
 	}
 	s.mu.RLock()
@@ -131,7 +120,7 @@ func (s *Server) OnSetup(ctx *gortsplib.ServerHandlerOnSetupCtx) (*base.Response
 }
 
 func (s *Server) OnPlay(ctx *gortsplib.ServerHandlerOnPlayCtx) (*base.Response, error) {
-	if err := s.tokens.Allow(context.Background(), queryToken(ctx.Query), "reader", ctx.Path); err != nil {
+	if err := s.allow(ctx.Conn.NetConn(), ctx.Path); err != nil {
 		return &base.Response{StatusCode: base.StatusUnauthorized}, nil
 	}
 	logx.Info("rtsp play", map[string]any{"path": ctx.Path})
@@ -139,7 +128,7 @@ func (s *Server) OnPlay(ctx *gortsplib.ServerHandlerOnPlayCtx) (*base.Response, 
 }
 
 func (s *Server) OnRecord(ctx *gortsplib.ServerHandlerOnRecordCtx) (*base.Response, error) {
-	if err := s.tokens.Allow(context.Background(), queryToken(ctx.Query), "publisher", ctx.Path); err != nil {
+	if err := s.allow(ctx.Conn.NetConn(), ctx.Path); err != nil {
 		return &base.Response{StatusCode: base.StatusUnauthorized}, nil
 	}
 	ctx.Session.OnPacketRTPAny(func(medi *description.Media, _ format.Format, pkt *rtp.Packet) {
@@ -162,7 +151,18 @@ func (s *Server) OnRecord(ctx *gortsplib.ServerHandlerOnRecordCtx) (*base.Respon
 	return &base.Response{StatusCode: base.StatusOK}, nil
 }
 
-func queryToken(q string) string {
-	values, _ := url.ParseQuery(q)
-	return values.Get("token")
+func (s *Server) allow(conn net.Conn, path string) error {
+	if !loopback(conn.RemoteAddr()) {
+		return session.ErrDenied
+	}
+	return s.sessions.AllowPath(context.Background(), path)
+}
+
+func loopback(addr net.Addr) bool {
+	host, _, err := net.SplitHostPort(addr.String())
+	if err != nil {
+		host = addr.String()
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
 }

@@ -1,0 +1,96 @@
+# Прототип: сервис заявок и ретранслятор на одном хосте.
+# Отдельные файлы для разных машин: ticket-service/docker-compose.yaml и relay-service/docker-compose.yaml.
+#
+#   docker compose up -d --build
+
+name: support-prototype
+
+services:
+  certs:
+    build: ./certs
+    network_mode: host
+    environment:
+      LETSENCRYPT_EMAIL: ${LETSENCRYPT_EMAIL:-}
+      TICKET_DOMAIN: ${TICKET_DOMAIN:-}
+      RELAY_DOMAIN: ${RELAY_DOMAIN:-}
+      LETSENCRYPT_STAGING: ${LETSENCRYPT_STAGING:-0}
+    volumes:
+      - letsencrypt:/etc/letsencrypt
+    restart: "no"
+
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: support
+      POSTGRES_PASSWORD: support
+      POSTGRES_DB: support
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./postgres-redis/init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U support -d support"]
+      interval: 2s
+      timeout: 3s
+      retries: 20
+
+  redis:
+    image: redis:7
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 3s
+      retries: 20
+
+  ticket:
+    build: ./ticket-service
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:18080:18080"
+    environment:
+      HTTP_ADDR: 0.0.0.0:18080
+      DATABASE_URL: postgres://support:support@postgres:5432/support?sslmode=disable
+      RELAY_INGEST_URL: http://relay:18082
+      RELAY_INGEST_TOKEN: ${RELAY_INGEST_TOKEN:-k7R_wQ3nM8pL2vX9cH4sD6fB1aY0uT5e}
+      SWAGGER_DOC_URL: /openapi/tickets.json
+      SHARD_COUNT: "4"
+      CLIENT_USER: client
+      CLIENT_PASSWORD: ${CLIENT_PASSWORD:-Yuvr4_U4n4uKy5eois-o55Z5reI6pKFT}
+      OPERATOR_USER: operator
+      OPERATOR_PASSWORD: ${OPERATOR_PASSWORD:-czixyK5esSuS2d990aicwQ-ruCSXt5Xp}
+    depends_on:
+      certs:
+        condition: service_completed_successfully
+      postgres:
+        condition: service_healthy
+
+  relay:
+    build: ./relay-service
+    restart: unless-stopped
+    ports:
+      - "18082:18082"
+      - "8554:8554"
+    environment:
+      INGEST_ADDR: 0.0.0.0:18082
+      SESSION_ADDR: :8554
+      RTSP_ADDR: 127.0.0.1:18554
+      REDIS_ADDR: redis:6379
+      RELAY_INGEST_TOKEN: ${RELAY_INGEST_TOKEN:-k7R_wQ3nM8pL2vX9cH4sD6fB1aY0uT5e}
+    depends_on:
+      redis:
+        condition: service_healthy
+
+  nginx:
+    image: nginx:1.27
+    network_mode: host
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - letsencrypt:/etc/letsencrypt:ro
+    depends_on:
+      certs:
+        condition: service_completed_successfully
+      ticket:
+        condition: service_started
+
+volumes:
+  letsencrypt:
+  pgdata:

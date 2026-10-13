@@ -33,28 +33,12 @@ server {
         proxy_pass http://127.0.0.1:18080;
     }
 
-    location /relay/health {
-        proxy_pass http://127.0.0.1:18081/health;
-    }
-
-    location /relay/api/ {
-        proxy_pass http://127.0.0.1:18081/api/;
-    }
-
     location = /openapi/tickets.json {
         proxy_pass http://127.0.0.1:18080/openapi.json;
     }
 
-    location = /openapi/relay.json {
-        proxy_pass http://127.0.0.1:18081/openapi.json;
-    }
-
     location /swagger/tickets/ {
         proxy_pass http://127.0.0.1:18080/swagger/;
-    }
-
-    location /swagger/relay/ {
-        proxy_pass http://127.0.0.1:18081/swagger/;
     }
 
     location /swagger/ {
@@ -188,28 +172,12 @@ server {
         proxy_pass http://127.0.0.1:18080;
     }
 
-    location /relay/health {
-        proxy_pass http://127.0.0.1:18081/health;
-    }
-
-    location /relay/api/ {
-        proxy_pass http://127.0.0.1:18081/api/;
-    }
-
     location = /openapi/tickets.json {
         proxy_pass http://127.0.0.1:18080/openapi.json;
     }
 
-    location = /openapi/relay.json {
-        proxy_pass http://127.0.0.1:18081/openapi.json;
-    }
-
     location /swagger/tickets/ {
         proxy_pass http://127.0.0.1:18080/swagger/;
-    }
-
-    location /swagger/relay/ {
-        proxy_pass http://127.0.0.1:18081/swagger/;
     }
 }
 EOF
@@ -305,13 +273,13 @@ server {
     ssl_protocols TLSv1.2 TLSv1.3;
 
     location /health {
-        proxy_pass http://127.0.0.1:18081/health;
+        proxy_pass http://127.0.0.1:18082/health;
     }
 
     location /api/ {
         proxy_set_header Host \$host;
         proxy_set_header X-Forwarded-Proto https;
-        proxy_pass http://127.0.0.1:18081;
+        proxy_pass http://127.0.0.1:18082;
     }
 
     location / {
@@ -341,28 +309,12 @@ server {
         proxy_pass http://127.0.0.1:18080;
     }
 
-    location /relay/health {
-        proxy_pass http://127.0.0.1:18081/health;
-    }
-
-    location /relay/api/ {
-        proxy_pass http://127.0.0.1:18081/api/;
-    }
-
     location = /openapi/tickets.json {
         proxy_pass http://127.0.0.1:18080/openapi.json;
     }
 
-    location = /openapi/relay.json {
-        proxy_pass http://127.0.0.1:18081/openapi.json;
-    }
-
     location /swagger/tickets/ {
         proxy_pass http://127.0.0.1:18080/swagger/;
-    }
-
-    location /swagger/relay/ {
-        proxy_pass http://127.0.0.1:18081/swagger/;
     }
 }
 EOF

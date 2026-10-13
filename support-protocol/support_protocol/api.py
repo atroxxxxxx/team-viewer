@@ -1,11 +1,6 @@
 import json
-from urllib.parse import quote
 
 import httpx
-
-
-def media_url(base: str, path: str, token: str) -> str:
-    return base.rstrip("/") + path + "?token=" + quote(token, safe="")
 
 
 class TicketAPI:
@@ -22,15 +17,11 @@ class TicketAPI:
     def create_ticket(self, account_id: str, description: str, camera: bool) -> dict:
         return self._json("POST", "/api/v1/tickets", {"account_id": account_id, "description": description, "camera": camera})
 
-    def media_up(self, ticket_id: str, camera: bool) -> dict:
-        body = {"screen": "up", "camera": "up" if camera else "off"}
-        return self._json("POST", f"/api/v1/tickets/{ticket_id}/media", body)
-
     def list_queued(self) -> list:
         return self._json("GET", "/api/v1/tickets").get("tickets") or []
 
-    def claim(self, ticket_id: str, operator_id: str) -> dict:
-        return self._json("POST", f"/api/v1/tickets/{ticket_id}/claim", {"operator_id": operator_id})
+    def claim(self, ticket_id: str) -> dict:
+        return self._json("POST", f"/api/v1/tickets/{ticket_id}/claim", {})
 
     def session(self, ticket_id: str) -> dict:
         return self._json("GET", f"/api/v1/tickets/{ticket_id}/session")

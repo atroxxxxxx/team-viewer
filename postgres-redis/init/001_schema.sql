@@ -49,25 +49,13 @@ CREATE TABLE tickets (
     status text NOT NULL,
     camera boolean NOT NULL DEFAULT false,
     assignee uuid,
+    token_hash text NOT NULL,
+    tunnel_id uuid,
     created_at timestamptz NOT NULL DEFAULT now(),
     PRIMARY KEY (shard_id, id)
 ) PARTITION BY LIST (shard_id);
 CALL attach_shards('tickets'::regclass);
 CREATE INDEX tickets_status_created_idx ON tickets (status, created_at DESC);
-
-CREATE TABLE media_grants (
-    shard_id smallint NOT NULL,
-    id uuid NOT NULL,
-    ticket_id uuid NOT NULL,
-    role text NOT NULL CHECK (role IN ('publisher', 'reader')),
-    path text NOT NULL,
-    token_hash text NOT NULL,
-    expires_at timestamptz NOT NULL,
-    revoked_at timestamptz,
-    PRIMARY KEY (shard_id, id),
-    FOREIGN KEY (shard_id, ticket_id) REFERENCES tickets (shard_id, id)
-) PARTITION BY LIST (shard_id);
-CALL attach_shards('media_grants'::regclass);
 
 CREATE TABLE action_log (
     shard_id smallint NOT NULL,
@@ -82,9 +70,6 @@ CREATE TABLE action_log (
     FOREIGN KEY (shard_id, ticket_id) REFERENCES tickets (shard_id, id)
 ) PARTITION BY LIST (shard_id);
 CALL attach_shards('action_log'::regclass);
-
--- Таблицы ниже нужны следующим сценариям. API их пока не пишет,
--- но ключ секции уже тот же, чтобы не перекладывать данные потом.
 
 CREATE TABLE problems (
     shard_id smallint NOT NULL,

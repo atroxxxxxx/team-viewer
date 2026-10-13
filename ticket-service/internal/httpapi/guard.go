@@ -91,7 +91,7 @@ func (s *Server) requirePublisher(c *gin.Context) {
 		return
 	}
 	raw := c.GetHeader("X-Ticket-Token")
-	matches, err := s.store.TokenMatches(c.Request.Context(), shardID, ticketID, "publisher", token.Hash(raw))
+	matches, err := s.store.TokenMatches(c.Request.Context(), shardID, ticketID, token.Hash(raw))
 	if err != nil {
 		writeStoreErr(c, err)
 		c.Abort()

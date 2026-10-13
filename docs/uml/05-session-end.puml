@@ -1,5 +1,5 @@
 @startuml 05-session-end
-title 05. Подтверждение, обрыв потока, выход из чата
+title 05. Подтверждение и снятие туннеля
 skinparam defaultFontName DejaVu Sans
 skinparam sequenceMessageAlign left
 autonumber
@@ -8,15 +8,15 @@ actor "Оператор" as Operator
 participant "Приложение оператора" as OpApp
 participant "Сервис заявок" as Tickets
 database "PostgreSQL" as DB
+participant "Ретранслятор" as Relay
 collections "Redis" as Cache
-participant "Ретранслятор RTSP" as Relay
 participant "Клиентское приложение" as Client
 actor "Клиент" as User
 
 Operator -> OpApp : Считает проблему решённой
 OpApp -> Tickets : POST /resolution {accept: true}\nBasic operator
 note over Tickets
-  Роль берётся из учётки, не из JSON.
+  Роль берётся из учётки.
   Незакрытые шаги дают 409.
 end note
 Tickets -> DB : confirmation operator,\nstatus=awaiting_client
@@ -26,22 +26,15 @@ Client -> User : «Проблема решена?»
 
 alt Клиент не согласен
   User -> Client : Нет
-  Client -> Tickets : POST /resolution {accept: false}\nX-Ticket-Token
-  Tickets -> DB : confirmation client=rejected
+  Client -> Tickets : POST /resolution {accept: false}
   Tickets -> DB : status=remote_control или guided
-  Tickets -> OpApp : Сессия продолжается
 else Клиент согласен
   User -> Client : Да
   Client -> Tickets : POST /resolution {accept: true}
-  Tickets -> DB : status=resolved,\nmedia_grants.revoked_at,\noperator left_at
-  Tickets -> Cache : DEL media:token и lock:ticket
-  note over Relay
-    Отдельного вызова ретранслятору нет.
-    Следующая RTSP-команда без токена в Redis
-    получает 401, клиент останавливает ffmpeg.
-  end note
-  Client -> Tickets : GET /session, status=resolved
-  Client -> Relay : Закрыть публикацию
-  OpApp -> Relay : Закрыть просмотр
+  Tickets -> DB : status=resolved,\noperator left_at
+  Tickets -> Relay : DELETE :18082 /api/v1/tunnels/{ticket}
+  Relay -> Cache : DEL client:{uuid} и tunnel:{id}
+  Client -> Client : Остановить ffmpeg и локальный мост
+  OpApp -> OpApp : Закрыть просмотр
 end
 @enduml

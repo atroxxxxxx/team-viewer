@@ -7,6 +7,7 @@ import (
 	"strings"
 	"time"
 
+	"ticket-service/internal/logx"
 	"ticket-service/internal/policy"
 	"ticket-service/internal/store"
 
@@ -363,7 +364,9 @@ func (s *Server) postResolution(c *gin.Context) {
 		return
 	}
 	if status == "resolved" {
-		_ = s.cache.RevokeTicketMedia(c.Request.Context(), ticketID.String())
+		if err := s.relay.Close(c.Request.Context(), ticketID); err != nil {
+			logx.Error("relay close", map[string]any{"err": err.Error(), "ticket_id": ticketID.String()})
+		}
 	}
 	c.JSON(http.StatusOK, gin.H{"status": status})
 }

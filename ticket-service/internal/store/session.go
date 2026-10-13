@@ -451,12 +451,6 @@ func (s *Store) Confirm(ctx context.Context, shardID int, ticketID uuid.UUID, ro
 	if operatorYes && clientYes {
 		status = "resolved"
 		if _, err := tx.Exec(ctx, `
-			UPDATE media_grants SET revoked_at = now()
-			WHERE shard_id = $1 AND ticket_id = $2 AND revoked_at IS NULL`,
-			shardID, pgUUID(ticketID)); err != nil {
-			return "", err
-		}
-		if _, err := tx.Exec(ctx, `
 			UPDATE chat_members SET left_at = now()
 			WHERE shard_id = $1 AND ticket_id = $2 AND role = 'operator' AND left_at IS NULL`,
 			shardID, pgUUID(ticketID)); err != nil {

@@ -2,63 +2,58 @@ package main
 
 import (
 	"context"
-	"embed"
 	"os"
 	"os/signal"
 	"syscall"
 	"time"
 
-	"relay-service/internal/auth"
 	"relay-service/internal/httpapi"
 	"relay-service/internal/logx"
 	"relay-service/internal/rtsp"
-	"relay-service/internal/token"
+	"relay-service/internal/session"
 )
 
-//go:embed openapi.json
-var specFS embed.FS
-
 func main() {
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
 
-	creds, err := auth.New(env("CLIENT_USER", ""), env("CLIENT_PASSWORD", ""), env("OPERATOR_USER", ""), env("OPERATOR_PASSWORD", ""))
+	pingCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	sessions := session.Open(env("REDIS_ADDR", "127.0.0.1:6379"))
+	err := sessions.Ping(pingCtx)
+	cancel()
 	if err != nil {
-		logx.Error("auth", map[string]any{"err": err.Error()})
-		os.Exit(1)
-	}
-	tokens := token.Open(env("REDIS_ADDR", "127.0.0.1:6379"))
-	if err := tokens.Ping(ctx); err != nil {
 		logx.Error("redis", map[string]any{"err": err.Error()})
 		os.Exit(1)
 	}
-	streams := rtsp.New(env("RTSP_ADDR", ":8554"), tokens)
+
+	rtspAddr := env("RTSP_ADDR", "127.0.0.1:18554")
+	streams := rtsp.New(rtspAddr, sessions)
 	if err := streams.Start(); err != nil {
 		logx.Error("rtsp", map[string]any{"err": err.Error()})
 		os.Exit(1)
 	}
 	defer streams.Close()
 
-	spec, err := specFS.ReadFile("openapi.json")
-	if err != nil {
-		logx.Error("openapi", map[string]any{"err": err.Error()})
-		os.Exit(1)
-	}
-	addr := env("HTTP_ADDR", "127.0.0.1:18081")
-	httpSrv := httpapi.New(tokens, streams, creds, spec, env("SWAGGER_DOC_URL", "/swagger/doc.json"))
-	errCh := make(chan error, 1)
+	bridge := session.NewBridge(env("SESSION_ADDR", ":8554"), rtspAddr, sessions)
 	go func() {
-		logx.Info("listen", map[string]any{"http": addr, "rtsp": env("RTSP_ADDR", ":8554")})
-		errCh <- httpSrv.Router().Run(addr)
+		if err := bridge.Serve(ctx); err != nil {
+			logx.Error("session", map[string]any{"err": err.Error()})
+			os.Exit(1)
+		}
 	}()
 
-	stop := make(chan os.Signal, 1)
-	signal.Notify(stop, syscall.SIGINT, syscall.SIGTERM)
+	addr := env("INGEST_ADDR", ":18082")
+	httpSrv := httpapi.New(sessions, env("RELAY_INGEST_TOKEN", ""))
+	errCh := make(chan error, 1)
+	go func() {
+		logx.Info("listen", map[string]any{"ingest": addr, "session": env("SESSION_ADDR", ":8554"), "rtsp": rtspAddr})
+		errCh <- httpSrv.Router().Run(addr)
+	}()
 	select {
 	case err := <-errCh:
 		logx.Error("http", map[string]any{"err": err.Error()})
 		os.Exit(1)
-	case <-stop:
+	case <-ctx.Done():
 		logx.Info("stop", nil)
 	}
 }

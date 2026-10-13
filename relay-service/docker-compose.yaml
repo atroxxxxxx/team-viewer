@@ -1,0 +1,32 @@
+# Ретранслятор на своём сервере: Redis и два порта.
+# 18082 принимает утверждённую заявку, 8554 — сессия клиента и оператора.
+# RELAY_INGEST_TOKEN должен совпадать с сервисом заявок.
+#
+#   docker compose -f relay-service/docker-compose.yaml up -d --build
+
+name: support-relay
+
+services:
+  redis:
+    image: redis:7
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 3s
+      retries: 20
+
+  relay:
+    build: .
+    restart: unless-stopped
+    ports:
+      - "18082:18082"
+      - "8554:8554"
+    environment:
+      INGEST_ADDR: 0.0.0.0:18082
+      SESSION_ADDR: :8554
+      RTSP_ADDR: 127.0.0.1:18554
+      REDIS_ADDR: redis:6379
+      RELAY_INGEST_TOKEN: ${RELAY_INGEST_TOKEN:-k7R_wQ3nM8pL2vX9cH4sD6fB1aY0uT5e}
+    depends_on:
+      redis:
+        condition: service_healthy

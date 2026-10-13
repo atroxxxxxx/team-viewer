@@ -17,10 +17,11 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from support_protocol.api import TicketAPI, media_url
-from support_protocol.endpoints import load_endpoints
+from support_protocol.api import TicketAPI
+from support_protocol.endpoints import config_file, load_endpoints
 from support_protocol.media import FRAME_HEIGHT, FRAME_WIDTH, publish_args
 from support_protocol.policy import validate_input
+from support_protocol.tunnel import LocalRTSPBridge
 
 ROOT = Path(__file__).resolve().parents[1]
 STATE = ROOT / ".state" / "account_id"
@@ -30,13 +31,15 @@ class ClientWindow(QWidget):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Клиент техподдержки")
-        api_base, rtsp_base, username, password, tls_verify = load_endpoints(ROOT / "config.yaml")
+        api_base, relay_host, relay_port, username, password, tls_verify = load_endpoints(
+            config_file(ROOT / "config.yaml", "SUPPORT_CLIENT_CONFIG")
+        )
         self.api = TicketAPI(api_base, username, password, verify=tls_verify)
+        self.relay_host = relay_host
+        self.relay_port = relay_port
         self.account_id = _load_id(STATE)
         self.ticket_id = ""
-        self.publisher_token = ""
-        self.rtsp_base = rtsp_base
-        self.paths: list[str] = []
+        self.bridge: LocalRTSPBridge | None = None
         self.answered_grant = ""
         self.handled_inputs: set[str] = set()
         self.procs: list[QProcess] = []
@@ -58,7 +61,7 @@ class ClientWindow(QWidget):
         self.steps = QListWidget()
         self.observation = QLineEdit()
         self.observation.setPlaceholderText("Что получилось на этом шаге")
-        start = QPushButton("Создать заявку и показать экран")
+        start = QPushButton("Создать заявку")
         start.clicked.connect(self.start_ticket)
         send = QPushButton("Отправить в чат")
         send.clicked.connect(self.send_chat)
@@ -101,29 +104,11 @@ class ClientWindow(QWidget):
             self.status.setText(str(exc))
             return
         self.ticket_id = created["ticket_id"]
-        self.publisher_token = created["publisher_token"]
-        self.api.ticket_token = self.publisher_token
-        self.paths = created.get("paths") or []
+        self.api.ticket_token = created["ticket_token"]
         self.scale = 2
-        if not self._publish("screen", 0):
-            self.scale = 1
-            if not self._publish("testsrc", 0):
-                self.status.setText("Не удалось запустить публикацию экрана")
-                return
-        if self.camera.isChecked() and len(self.paths) > 1:
-            if not self._publish("camera", 1):
-                self._publish("testsrc", 1)
-        try:
-            self.api.media_up(self.ticket_id, self.camera.isChecked())
-        except RuntimeError as exc:
-            self.status.setText(str(exc))
-            return
-        self.status.setText(f"Заявка {self.ticket_id} в очереди")
+        self.status.setText(f"Заявка {self.ticket_id} ждёт оператора")
 
-    def _publish(self, mode: str, index: int) -> bool:
-        if index >= len(self.paths):
-            return False
-        url = media_url(self.rtsp_base, self.paths[index], self.publisher_token)
+    def _publish(self, mode: str, url: str) -> bool:
         try:
             args = publish_args(url, mode, os.environ.get("DISPLAY", ":0"))
         except RuntimeError as exc:
@@ -136,6 +121,22 @@ class ClientWindow(QWidget):
         self.procs.append(proc)
         return True
 
+    def _start_tunnel(self, account_id: str, tunnel_id: str, camera: bool) -> None:
+        self.bridge = LocalRTSPBridge(self.relay_host, self.relay_port, "CLIENT", account_id)
+        screen = self.bridge.url(f"/tunnels/{tunnel_id}/screen")
+        if not self._publish("screen", screen):
+            self.scale = 1
+            if not self._publish("testsrc", screen):
+                self.bridge.close()
+                self.bridge = None
+                self.status.setText("Не удалось запустить публикацию экрана")
+                return
+        if camera:
+            camera_url = self.bridge.url(f"/tunnels/{tunnel_id}/camera")
+            if not self._publish("camera", camera_url):
+                self._publish("testsrc", camera_url)
+        self.status.setText(f"Экран идёт в туннель {tunnel_id}")
+
     def refresh(self) -> None:
         if not self.ticket_id:
             return
@@ -145,8 +146,13 @@ class ClientWindow(QWidget):
             self.status.setText(str(exc))
             return
         ticket = session.get("ticket") or {}
-        self.status.setText(f"{ticket.get('status', '')} · {self.ticket_id}")
-        if ticket.get("status") == "resolved":
+        status = ticket.get("status", "")
+        tunnel_id = ticket.get("tunnel_id") or ""
+        if tunnel_id and self.bridge is None and status != "resolved":
+            self._start_tunnel(ticket.get("account_id") or self.account_id, tunnel_id, bool(ticket.get("camera")))
+        elif self.bridge is None:
+            self.status.setText(f"{status} · {self.ticket_id}")
+        if status == "resolved":
             self.stop_media()
         lines = [f"{item.get('author')}: {item.get('body')}" for item in session.get("messages") or []]
         self.chat.setPlainText("\n".join(lines))
@@ -245,6 +251,9 @@ class ClientWindow(QWidget):
         for proc in self.procs:
             proc.terminate()
         self.procs.clear()
+        if self.bridge is not None:
+            self.bridge.close()
+            self.bridge = None
 
     def closeEvent(self, event) -> None:
         self.stop_media()

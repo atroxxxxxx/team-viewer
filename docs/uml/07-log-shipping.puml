@@ -5,7 +5,7 @@ skinparam sequenceMessageAlign left
 autonumber
 
 participant "Сервис заявок" as Tickets
-participant "Ретранслятор RTSP" as Relay
+participant "Ретранслятор" as Relay
 database "PostgreSQL" as DB
 participant "Logstash" as Logstash
 database "Elasticsearch" as Elastic

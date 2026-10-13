@@ -1,57 +1,40 @@
 @startuml 02-operator-connect
-title 02. Подключение оператора и туннель
+title 02. Утверждение и туннель
 skinparam defaultFontName DejaVu Sans
 skinparam sequenceMessageAlign left
 autonumber
 
 actor "Оператор" as Operator
-participant "Приложение оператора" as App
-participant "Nginx" as Edge
+participant "Приложение оператора" as Op
 participant "Сервис заявок" as Tickets
 database "PostgreSQL" as DB
+participant "Ретранслятор" as Relay
 collections "Redis" as Cache
-participant "Ретранслятор RTSP" as Relay
+participant "Клиентское приложение" as Client
 
-note over App
-  config.yaml: логин operator.
-  Идентификатор оператора считает сервис,
-  тело запроса его не задаёт.
-end note
-App -> Edge : GET /api/v1/tickets\nBasic operator
-Edge -> Tickets : очередь
+Op -> Tickets : GET /api/v1/tickets\nBasic operator
 Tickets -> DB : SELECT status=queued
-Tickets -> App : Список с описанием
+Tickets -> Op : Список с описанием
 
-App -> Edge : POST /tickets/{id}/claim\nBasic operator
-Edge -> Tickets : захват
-Tickets -> Cache : SETNX lock:ticket:{id}
+Op -> Tickets : POST /tickets/{id}/claim
+Tickets -> Relay : POST :18082 /api/v1/tunnels\nBearer, client_id и ticket_id
+Relay -> Cache : SET client:{uuid} и tunnel:{id}\nTTL 15 минут
+Relay -> Tickets : tunnel_id
+Tickets -> DB : status=assigned, tunnel_id
+Tickets -> Op : account_id, tunnel_id
 
-alt Заявка уже занята
-  Tickets -> App : 409 Conflict
-else Блокировка получена
-  Tickets -> DB : status=assigned,\nassignee=id оператора
-  Tickets -> DB : INSERT reader grant
-  Tickets -> Cache : SET media:token читателя,\nSADD presence operator
-  Tickets -> DB : INSERT chat_member operator
-  Tickets -> App : reader_token, пути
+Op -> Relay : TCP :8554\nOPERATOR {uuid клиента}
+Client -> Tickets : GET /session
+Tickets -> Client : tunnel_id
+Client -> Relay : TCP :8554\nCLIENT {uuid}
 
-  App -> Relay : TCP :8554, RTSP DESCRIBE + PLAY\n/sessions/{id}/screen?token=reader
-  note over Relay
-    RECORD клиента и PLAY оператора
-    склеены на одном порту.
-    Без reader-токена DESCRIBE получает 401.
-  end note
-  Relay -> Cache : Проверка хеша, роль reader
-  Relay -> App : RTP экрана interleaved
+note over Relay
+  RTSP слушает только 127.0.0.1:18554.
+  Сессионный порт склеивает внешнее соединение
+  с этим локальным RTSP.
+end note
 
-  opt В заявке есть камера
-    App -> Relay : RTSP PLAY /sessions/{id}/camera
-    Relay -> App : RTP камеры
-  end
-
-  loop Раз в секунду
-    App -> Tickets : GET /tickets/{id}/session
-    Tickets -> App : Описание, чат, план, грант
-  end
-end
+Client -> Client : ffmpeg на rtsp://127.0.0.1
+Op -> Op : ffmpeg читает rtsp://127.0.0.1
+Relay -> Relay : Локальный RTSP отдаёт экран оператору
 @enduml
