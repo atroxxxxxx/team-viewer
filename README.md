@@ -17,7 +17,8 @@
 | [operator-app](operator-app/README.md) | Оператор, человек или три локальные модели |
 | [DEBIANIZE.md](DEBIANIZE.md) | Сборка deb для клиента и оператора |
 | [support-protocol](support-protocol/support_protocol/policy.py) | Общий валидатор ввода и шагов |
-| [docs/uml](docs/uml/README.md) | UML sequence-диаграммы |
+| [docs](docs/README.md) | Архитектура и диаграммы |
+| [docs/PARTS.md](docs/PARTS.md) | Обязательные документы трёх частей |
 | [TODO.md](TODO.md) | Планы и известные ошибки |
 
 Правила команд и журнал обучения по-прежнему только в описании и в git не входят. См. `.gitignore`.

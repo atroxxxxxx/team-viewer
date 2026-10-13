@@ -45,4 +45,4 @@ python3 -m venv .venv
 | [relay-service](../relay-service/README.md) | Исходящая публикация экрана и камеры |
 | [safety-policy](../safety-policy/README.md) | Локальный валидатор перед исполнением |
 
-Сценарии: [заявка](../docs/uml/01-ticket-and-publish.md), [управление](../docs/uml/03-remote-control.md), [план](../docs/uml/04-step-plan.md), [завершение](../docs/uml/05-session-end.md).
+Сценарии: [заявка](../docs/README.md#d01), [управление](../docs/README.md#d03), [план](../docs/README.md#d04), [завершение](../docs/README.md#d05).

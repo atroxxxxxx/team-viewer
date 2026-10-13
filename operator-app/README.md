@@ -58,4 +58,4 @@ python3 -m operator_app.main --no-models
 | [relay-service](../relay-service/README.md) | Просмотр экрана и камеры |
 | [safety-policy](../safety-policy/README.md) | Правила и валидатор до отправки |
 
-Сценарии: [подключение](../docs/uml/02-operator-connect.md), [управление](../docs/uml/03-remote-control.md), [план](../docs/uml/04-step-plan.md), [завершение](../docs/uml/05-session-end.md).
+Сценарии: [подключение](../docs/README.md#d02), [управление](../docs/README.md#d03), [план](../docs/README.md#d04), [завершение](../docs/README.md#d05). Какие документы обязательны у части, сказано в [PARTS.md](../docs/PARTS.md).

@@ -12,4 +12,4 @@
 
 ## ELK
 
-СПЕЦПОМЕТКА. Elasticsearch, Logstash и Kibana сюда не входят. Сервисы пишут JSON в stdout. Сбор показан пунктиром на диаграмме [07](../docs/uml/07-log-shipping.md).
+СПЕЦПОМЕТКА. Elasticsearch, Logstash и Kibana сюда не входят. Сервисы пишут JSON в stdout. Сбор показан пунктиром на [диаграмме 07](../docs/README.md#d07).
