@@ -1,0 +1,4 @@
+-c requirements-dev.lock
+-r ticket-service/requirements.txt
+pytest
+python-dotenv
