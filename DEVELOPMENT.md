@@ -1,6 +1,27 @@
 # Работа с ticket-service
 
-Нужен Python 3.11+ с pip. Среда разработки устанавливается в `.venv`, версии фиксируются в `requirements-dev.lock`. Команды выполняются из корня репозитория. В Windows можно использовать `dev.cmd`; для Linux те же команды запускаются как `.venv/bin/python scripts/dev.py ...`.
+Нужен Python 3.11+ с поддержкой `venv`. Среда разработки устанавливается в `.venv`, версии фиксируются в `requirements-dev.lock`. Команды выполняются из корня репозитория: `dev.cmd` в Windows, `sh dev.sh` в Linux. Активация окружения и системный pip не требуются.
+
+## Первоначальная настройка Linux
+
+Для Debian/Ubuntu с Python 3.11+:
+
+```sh
+sudo apt update
+sudo apt install python3 python3-venv postgresql
+sh dev.sh setup --postgres
+sh dev.sh db-start
+sh dev.sh test -q
+sh dev.sh serve --fake-relay
+```
+
+Для Fedora установите зависимости через `sudo dnf install python3 python3-pip postgresql-server`, затем выполните те же команды `sh dev.sh ...`. На других дистрибутивах нужны Python 3.11+, модуль `venv`/`ensurepip` и серверные бинарники PostgreSQL; рекомендуемая версия PostgreSQL — 16, как в compose. Для отдельного Python можно задать `SUPPORT_PYTHON=python3.12 sh dev.sh setup --postgres`.
+
+В Linux `setup --postgres` находит установленный PostgreSQL через `PG_BIN`, PATH, `pg_config --bindir`, каталоги Debian `/usr/lib/postgresql/<версия>/bin` и RPM `/usr/pgsql-<версия>/bin`. ZIP для Windows не скачивается. При необходимости задайте `PG_BIN=/путь/к/postgresql/bin`; в каталоге должны находиться `pg_ctl`, `initdb` и `postgres`.
+
+`sudo` нужен только для установки системных пакетов. Команды проекта выполняются обычным пользователем: `initdb` создаёт отдельный кластер в `.dev/pgdata`, системная служба PostgreSQL не используется. Кластер слушает TCP `127.0.0.1:15432`, системный Unix-сокет не создаётся. Новый `.env.dev` и временный файл пароля доступны только владельцу. Остановка: `sh dev.sh db-stop`.
+
+Используйте отдельный клон для Windows и Linux/WSL: `.venv` и каталог данных PostgreSQL нельзя переносить между ОС.
 
 ## Первоначальная настройка Windows
 
@@ -10,7 +31,7 @@ dev.cmd db-start
 dev.cmd test -q
 ```
 
-`setup` устанавливает зависимости ticket-service и pytest, создаёт `.env.dev` со случайными локальными паролями и сохраняет существующий файл при повторном запуске. Ключ `--postgres` скачивает [ZIP PostgreSQL 16 от EDB](https://www.enterprisedb.com/download-postgresql-binaries) в `.dev`; системная служба, PATH и настройки установленной БД не меняются. Можно указать свой каталог бинарников через `PG_BIN`.
+`setup` устанавливает зависимости ticket-service и pytest в `.venv`, создаёт `.env.dev` со случайными локальными паролями и сохраняет существующий файл при повторном запуске. В Windows ключ `--postgres` скачивает [ZIP PostgreSQL 16 от EDB](https://www.enterprisedb.com/download-postgresql-binaries) в `.dev`; системная служба, PATH и настройки установленной БД не меняются. Можно указать свой каталог бинарников через `PG_BIN`.
 
 `db-start` запускает только локальный кластер `.dev/pgdata` на `127.0.0.1:15432`, создаёт базы `support_dev` и `support_test` и применяет исходную SQL-схему к новой dev-базе. Повторный запуск не удаляет данные и не выполняет init второй раз. Для остановки: `dev.cmd db-stop`. Секреты, данные PostgreSQL, архивы и виртуальная среда исключены из Git.
 
@@ -22,6 +43,8 @@ dev.cmd test -q
 dev.cmd check
 dev.cmd serve --fake-relay
 ```
+
+В Linux: `sh dev.sh db-start`, `sh dev.sh test -q`, `sh dev.sh check`, `sh dev.sh serve --fake-relay`.
 
 API открывается на `http://127.0.0.1:18080`, Swagger — `/swagger/index.html`, проверка БД — `/health`. Basic-пароли находятся в локальном `.env.dev`.
 
