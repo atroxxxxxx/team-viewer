@@ -6,7 +6,6 @@ from pathlib import Path
 
 from PyQt5.QtCore import QProcess, QTimer, Qt
 from PyQt5.QtWidgets import (
-    QCheckBox,
     QFormLayout,
     QHBoxLayout,
     QLabel,
@@ -19,7 +18,7 @@ from PyQt5.QtWidgets import (
     QWidget, QTabWidget, QScrollArea,
 )
 
-from support_protocol.ui import Background, STYLE, connection_settings, card, header, label, secondary, StatusLabel
+from support_protocol.ui import Background, STYLE, connection_settings, card, header, label, secondary, StatusLabel, CheckBox
 from support_protocol.api import TicketAPI
 from support_protocol.endpoints import config_file, load_endpoints
 from support_protocol.media import FRAME_HEIGHT, FRAME_WIDTH, media_action, publish_args
@@ -63,8 +62,8 @@ class ClientWindow(QWidget, Background):
     def _build(self) -> None:
         self.description = QPlainTextEdit()
         self.description.setPlaceholderText("Что случилось")
-        self.camera = QCheckBox("Отдать камеру")
-        self.dangerous = QCheckBox("На экране диалог удаления или сброса")
+        self.camera = CheckBox("Отдать камеру")
+        self.dangerous = CheckBox("На экране диалог удаления или сброса")
         self.status = StatusLabel("Заявки нет")
         self.chat = QPlainTextEdit()
         self.chat.setReadOnly(True)
@@ -82,7 +81,7 @@ class ClientWindow(QWidget, Background):
         yes.clicked.connect(lambda: self.resolve(True))
         no = QPushButton("Не решено")
         no.clicked.connect(lambda: self.resolve(False))
-        self.description.setPlaceholderText("Например: не получается открыть программу или подключиться к сети")
+        self.description.setPlaceholderText("Описание проблемы")
         self.chat_line.setPlaceholderText("Сообщение оператору")
         self.status.setObjectName("status")
         self.status.setWordWrap(True)
@@ -92,20 +91,20 @@ class ClientWindow(QWidget, Background):
 
         device, device_layout = card()
         device_layout.addWidget(label("ВАШЕ УСТРОЙСТВО", "eyebrow"))
-        device_layout.addWidget(label("Доступ к этому компьютеру", "cardTitle", True))
-        device_layout.addWidget(label("Создайте заявку, чтобы оператор увидел её в очереди.", "muted", True))
         identity_box, identity_layout = card("inset", 14, 7)
         identity_layout.addWidget(label("ИДЕНТИФИКАТОР УСТРОЙСТВА", "eyebrow"))
         identity = label(self.account_id, "identity", True)
         identity.setTextInteractionFlags(Qt.TextSelectableByMouse)
         identity_layout.addWidget(identity)
         device_layout.addWidget(identity_box)
-        device_layout.addWidget(label("СОСТОЯНИЕ ЗАЯВКИ", "eyebrow"))
-        device_layout.addWidget(self.status)
-        device_layout.addSpacing(8)
-        device_layout.addWidget(label("Управление только с согласия", "cardTitle", True))
-        device_layout.addWidget(label("Перед управлением мышью и клавиатурой приложение запросит ваше разрешение.", "muted", True))
-        device_layout.addStretch()
+        state_card, state_layout = card()
+        state_layout.addWidget(label("СОСТОЯНИЕ ЗАЯВКИ", "eyebrow"))
+        state_layout.addWidget(self.status)
+        left_column = QVBoxLayout()
+        left_column.setSpacing(16)
+        left_column.addWidget(device)
+        left_column.addWidget(state_card)
+        left_column.addStretch()
 
         request = QWidget()
         request.setObjectName("tabPage")
@@ -113,7 +112,6 @@ class ClientWindow(QWidget, Background):
         form.setContentsMargins(0, 18, 0, 0)
         form.setSpacing(13)
         form.addWidget(label("Опишите проблему", "cardTitle"))
-        form.addWidget(label("Подробности помогут оператору быстрее разобраться в ситуации.", "muted", True))
         form.addWidget(self.description, 1)
         form.addWidget(self.camera)
         form.addWidget(self.dangerous)
@@ -143,18 +141,18 @@ class ClientWindow(QWidget, Background):
         tabs = QTabWidget()
         tabs.addTab(request, "Заявка")
         tabs.addTab(discussion, "Чат")
-        tabs.addTab(plan_page, "План и завершение")
+        tabs.addTab(plan_page, "План")
         workspace, workspace_layout = card()
         workspace_layout.addWidget(label("ОБРАЩЕНИЕ В ПОДДЕРЖКУ", "eyebrow"))
         workspace_layout.addWidget(tabs, 1)
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(30, 26, 30, 28)
-        layout.setSpacing(22)
-        layout.addLayout(header("Удалённая поддержка", "Помощь специалиста с вашего разрешения", lambda: connection_settings(self)))
+        layout.setSpacing(16)
+        layout.addLayout(header("Удалённая поддержка", lambda: connection_settings(self)))
         columns = QHBoxLayout()
         columns.setSpacing(16)
-        columns.addWidget(device, 4)
+        columns.addLayout(left_column, 4)
         columns.addWidget(workspace, 6)
         layout.addLayout(columns, 1)
         self.setStyleSheet(STYLE)

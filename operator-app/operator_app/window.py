@@ -5,7 +5,6 @@ from PyQt5.QtCore import QBuffer, QIODevice, QProcess, Qt, QTimer
 from PyQt5.QtGui import QImage, QPixmap
 from PyQt5.QtWidgets import (
     QApplication,
-    QCheckBox,
     QHBoxLayout,
     QLabel,
     QLineEdit,
@@ -17,7 +16,7 @@ from PyQt5.QtWidgets import (
 )
 
 from operator_app.agent import next_action
-from support_protocol.ui import Background, STYLE, connection_settings, card, header, label, secondary, StatusLabel, DesktopPreview
+from support_protocol.ui import Background, STYLE, connection_settings, card, header, label, secondary, StatusLabel, CheckBox, DesktopPreview
 from support_protocol.api import TicketAPI
 from support_protocol.endpoints import config_file, load_endpoints
 from support_protocol.media import FRAME_HEIGHT, FRAME_WIDTH, play_args, should_open_player
@@ -72,7 +71,7 @@ class OperatorWindow(QWidget, Background):
         self.plan_text.setPlaceholderText("По одному шагу на строку")
         self.problem = QLineEdit()
         self.problem.setPlaceholderText("Что сломал этот шаг")
-        self.allow_model_input = QCheckBox("Модель может предлагать ввод")
+        self.allow_model_input = CheckBox("Модель может предлагать ввод")
         if self.models is None:
             self.model_note = QLabel("Режим человека: модели не скачиваются и шаг модели выключен")
         else:
@@ -119,7 +118,6 @@ class OperatorWindow(QWidget, Background):
         queue_layout.setContentsMargins(0, 18, 0, 0)
         queue_layout.setSpacing(12)
         queue_layout.addWidget(label("Очередь заявок", "cardTitle"))
-        queue_layout.addWidget(label("Выберите обращение для начала работы.", "muted", True))
         queue_layout.addWidget(self.queue, 1)
         queue_layout.addWidget(claim)
         queue_layout.addWidget(refresh)
@@ -167,7 +165,6 @@ class OperatorWindow(QWidget, Background):
         desktop, desktop_layout = card()
         desktop_layout.addWidget(label("УДАЛЁННОЕ УСТРОЙСТВО", "eyebrow"))
         desktop_layout.addWidget(label("Экран клиента", "cardTitle"))
-        desktop_layout.addWidget(label("Просмотр появится после принятия заявки.", "muted", True))
         viewport, viewport_layout = card("viewport", 12, 0)
         viewport_layout.addWidget(self.preview, 1)
         desktop_layout.addWidget(viewport, 1)
@@ -180,13 +177,14 @@ class OperatorWindow(QWidget, Background):
         split.addWidget(sidebar)
         split.addWidget(desktop)
         split.setChildrenCollapsible(False)
+        split.setHandleWidth(16)
         split.setStretchFactor(0, 4)
         split.setStretchFactor(1, 6)
         split.setSizes([400, 650])
         layout = QVBoxLayout(self)
         layout.setContentsMargins(30, 26, 30, 28)
         layout.setSpacing(16)
-        layout.addLayout(header("Панель оператора", "Заявки, общение и удалённая помощь в одном окне", lambda: connection_settings(self)))
+        layout.addLayout(header("Панель оператора", lambda: connection_settings(self)))
         layout.addWidget(self.status)
         layout.addWidget(split, 1)
         self.setStyleSheet(STYLE)
