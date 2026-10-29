@@ -17,7 +17,7 @@ from PyQt5.QtWidgets import (
 )
 
 from operator_app.agent import next_action
-from support_protocol.ui import Background, STYLE, connection_settings
+from support_protocol.ui import Background, STYLE, connection_settings, card, header, label, secondary, StatusLabel, DesktopPreview
 from support_protocol.api import TicketAPI
 from support_protocol.endpoints import config_file, load_endpoints
 from support_protocol.media import FRAME_HEIGHT, FRAME_WIDTH, play_args, should_open_player
@@ -59,8 +59,8 @@ class OperatorWindow(QWidget, Background):
 
     def _build(self) -> None:
         self.queue = QListWidget()
-        self.status = QLabel("Очередь пуста")
-        self.preview = QLabel("Экран появится после захвата")
+        self.status = StatusLabel("Очередь пуста")
+        self.preview = DesktopPreview("Экран появится после захвата")
         self.preview.setFixedSize(FRAME_WIDTH, FRAME_HEIGHT)
         self.preview.setAlignment(Qt.AlignCenter)
         self.preview.mousePressEvent = self.preview_click
@@ -105,27 +105,53 @@ class OperatorWindow(QWidget, Background):
         typed = QPushButton("Отправить текст")
         typed.clicked.connect(self.send_text)
         self.status.setObjectName("status")
-        title = QLabel("Панель оператора")
-        title.setObjectName("heading")
-        self.preview.setMinimumSize(320, 180)
+        self.status.setWordWrap(True)
+        self.preview.setMinimumSize(280, 160)
         self.preview.setMaximumSize(16777215, 16777215)
+        self.preview.setWordWrap(True)
         self.chat_line.setPlaceholderText("Сообщение клиенту")
+        for button in (refresh, send, done, nested, close, typed):
+            secondary(button)
+
         queue_page = QWidget()
+        queue_page.setObjectName("tabPage")
         queue_layout = QVBoxLayout(queue_page)
-        queue_layout.addWidget(refresh)
-        queue_layout.addWidget(self.queue)
+        queue_layout.setContentsMargins(0, 18, 0, 0)
+        queue_layout.setSpacing(12)
+        queue_layout.addWidget(label("Очередь заявок", "cardTitle"))
+        queue_layout.addWidget(label("Выберите обращение для начала работы.", "muted", True))
+        queue_layout.addWidget(self.queue, 1)
         queue_layout.addWidget(claim)
+        queue_layout.addWidget(refresh)
         chat_page = QWidget()
+        chat_page.setObjectName("tabPage")
         chat_layout = QVBoxLayout(chat_page)
-        chat_layout.addWidget(self.chat)
+        chat_layout.setContentsMargins(0, 18, 0, 0)
+        chat_layout.setSpacing(12)
+        chat_layout.addWidget(label("Диалог с клиентом", "cardTitle"))
+        chat_layout.addWidget(self.chat, 1)
         chat_layout.addWidget(self.chat_line)
         chat_layout.addWidget(send)
         plan_page = QWidget()
+        plan_page.setObjectName("tabPage")
         plan_layout = QVBoxLayout(plan_page)
-        for widget in (self.steps, self.plan_text, plan, done, self.problem, nested, close):
-            plan_layout.addWidget(widget)
+        plan_layout.setContentsMargins(0, 16, 0, 0)
+        plan_layout.setSpacing(8)
+        plan_layout.addWidget(self.steps, 1)
+        plan_layout.addWidget(self.plan_text, 1)
+        plan_row = QHBoxLayout()
+        plan_row.addWidget(plan)
+        plan_row.addWidget(done)
+        plan_layout.addLayout(plan_row)
+        plan_layout.addWidget(self.problem)
+        plan_layout.addWidget(nested)
+        plan_layout.addWidget(close)
         tools_page = QWidget()
+        tools_page.setObjectName("tabPage")
         tools_layout = QVBoxLayout(tools_page)
+        tools_layout.setContentsMargins(0, 18, 0, 0)
+        tools_layout.setSpacing(14)
+        tools_layout.addWidget(label("Помощник оператора", "cardTitle"))
         for widget in (self.model_note, self.allow_model_input, self.model_button):
             tools_layout.addWidget(widget)
         tools_layout.addStretch()
@@ -134,29 +160,38 @@ class OperatorWindow(QWidget, Background):
         tabs.addTab(chat_page, "Чат")
         tabs.addTab(plan_page, "План")
         tabs.addTab(tools_page, "Модель")
-        desktop = QWidget()
-        desktop_layout = QVBoxLayout(desktop)
-        desktop_layout.addWidget(self.preview, 1)
+        sidebar, side_layout = card()
+        side_layout.addWidget(label("РАБОЧЕЕ ПРОСТРАНСТВО", "eyebrow"))
+        side_layout.addWidget(tabs, 1)
+
+        desktop, desktop_layout = card()
+        desktop_layout.addWidget(label("УДАЛЁННОЕ УСТРОЙСТВО", "eyebrow"))
+        desktop_layout.addWidget(label("Экран клиента", "cardTitle"))
+        desktop_layout.addWidget(label("Просмотр появится после принятия заявки.", "muted", True))
+        viewport, viewport_layout = card("viewport", 12, 0)
+        viewport_layout.addWidget(self.preview, 1)
+        desktop_layout.addWidget(viewport, 1)
         desktop_layout.addWidget(control)
-        desktop_layout.addWidget(self.text_input)
-        desktop_layout.addWidget(typed)
+        text_row = QHBoxLayout()
+        text_row.addWidget(self.text_input, 1)
+        text_row.addWidget(typed)
+        desktop_layout.addLayout(text_row)
         split = QSplitter(Qt.Horizontal)
-        split.addWidget(tabs)
+        split.addWidget(sidebar)
         split.addWidget(desktop)
-        split.setStretchFactor(1, 2)
+        split.setChildrenCollapsible(False)
+        split.setStretchFactor(0, 4)
+        split.setStretchFactor(1, 6)
+        split.setSizes([400, 650])
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(24, 24, 24, 24)
-        settings = QPushButton("Настройки")
-        settings.clicked.connect(lambda: connection_settings(self))
-        header = QHBoxLayout()
-        header.addWidget(title, 1)
-        header.addWidget(settings)
-        layout.addLayout(header)
+        layout.setContentsMargins(30, 26, 30, 28)
+        layout.setSpacing(16)
+        layout.addLayout(header("Панель оператора", "Заявки, общение и удалённая помощь в одном окне", lambda: connection_settings(self)))
         layout.addWidget(self.status)
         layout.addWidget(split, 1)
         self.setStyleSheet(STYLE)
-        self.resize(1100, 720)
-        self.setMinimumSize(700, 480)
+        self.resize(1200, 760)
+        self.setMinimumSize(850, 580)
 
     def reload_queue(self) -> None:
         def done(tickets):
@@ -186,6 +221,7 @@ class OperatorWindow(QWidget, Background):
         def failed(error):
             self._claiming = False
             self.status.setText(str(error))
+            self.status.set_state("error")
         self.run_background(lambda: self.api.claim(ticket_id), done, failed)
     def _sync_player(self, account_id: str, tunnel_id: str, status: str) -> None:
         if status == "resolved" or not tunnel_id:
@@ -272,6 +308,7 @@ class OperatorWindow(QWidget, Background):
         def failed(error):
             self._polling = False
             self.status.setText(str(error))
+            self.status.set_state("error")
         self.run_background(lambda: self.api.session(ticket_id), done, failed)
 
     def _show_session(self) -> None:
