@@ -1,9 +1,9 @@
 import uuid
 from pathlib import Path
 
-from PySide6.QtCore import QBuffer, QIODevice, QProcess, Qt, QTimer
-from PySide6.QtGui import QImage, QPixmap
-from PySide6.QtWidgets import (
+from PyQt5.QtCore import QBuffer, QIODevice, QProcess, Qt, QTimer
+from PyQt5.QtGui import QImage, QPixmap
+from PyQt5.QtWidgets import (
     QApplication,
     QCheckBox,
     QHBoxLayout,
@@ -13,10 +13,11 @@ from PySide6.QtWidgets import (
     QPushButton,
     QPlainTextEdit,
     QVBoxLayout,
-    QWidget,
+    QWidget, QTabWidget, QSplitter,
 )
 
 from operator_app.agent import next_action
+from support_protocol.ui import Background, STYLE, connection_settings
 from support_protocol.api import TicketAPI
 from support_protocol.endpoints import config_file, load_endpoints
 from support_protocol.media import FRAME_HEIGHT, FRAME_WIDTH, play_args, should_open_player
@@ -27,7 +28,7 @@ ROOT = Path(__file__).resolve().parents[1]
 STATE = ROOT / ".state" / "operator_id"
 
 
-class OperatorWindow(QWidget):
+class OperatorWindow(QWidget, Background):
     def __init__(self, models: dict | None = None):
         super().__init__()
         self.models = models
@@ -47,6 +48,9 @@ class OperatorWindow(QWidget):
         self.player: QProcess | None = None
         self.buffer = bytearray()
         self.frame: QImage | None = None
+        self.init_background()
+        self._polling = False
+        self._claiming = False
         self._build()
         self.timer = QTimer(self)
         self.timer.timeout.connect(self.refresh)
@@ -58,7 +62,7 @@ class OperatorWindow(QWidget):
         self.status = QLabel("Очередь пуста")
         self.preview = QLabel("Экран появится после захвата")
         self.preview.setFixedSize(FRAME_WIDTH, FRAME_HEIGHT)
-        self.preview.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.preview.setAlignment(Qt.AlignCenter)
         self.preview.mousePressEvent = self.preview_click
         self.chat = QPlainTextEdit()
         self.chat.setReadOnly(True)
@@ -100,63 +104,94 @@ class OperatorWindow(QWidget):
         self.allow_model_input.setEnabled(self.models is not None)
         typed = QPushButton("Отправить текст")
         typed.clicked.connect(self.send_text)
+        self.status.setObjectName("status")
+        title = QLabel("Панель оператора")
+        title.setObjectName("heading")
+        self.preview.setMinimumSize(320, 180)
+        self.preview.setMaximumSize(16777215, 16777215)
+        self.chat_line.setPlaceholderText("Сообщение клиенту")
+        queue_page = QWidget()
+        queue_layout = QVBoxLayout(queue_page)
+        queue_layout.addWidget(refresh)
+        queue_layout.addWidget(self.queue)
+        queue_layout.addWidget(claim)
+        chat_page = QWidget()
+        chat_layout = QVBoxLayout(chat_page)
+        chat_layout.addWidget(self.chat)
+        chat_layout.addWidget(self.chat_line)
+        chat_layout.addWidget(send)
+        plan_page = QWidget()
+        plan_layout = QVBoxLayout(plan_page)
+        for widget in (self.steps, self.plan_text, plan, done, self.problem, nested, close):
+            plan_layout.addWidget(widget)
+        tools_page = QWidget()
+        tools_layout = QVBoxLayout(tools_page)
+        for widget in (self.model_note, self.allow_model_input, self.model_button):
+            tools_layout.addWidget(widget)
+        tools_layout.addStretch()
+        tabs = QTabWidget()
+        tabs.addTab(queue_page, "Заявки")
+        tabs.addTab(chat_page, "Чат")
+        tabs.addTab(plan_page, "План")
+        tabs.addTab(tools_page, "Модель")
+        desktop = QWidget()
+        desktop_layout = QVBoxLayout(desktop)
+        desktop_layout.addWidget(self.preview, 1)
+        desktop_layout.addWidget(control)
+        desktop_layout.addWidget(self.text_input)
+        desktop_layout.addWidget(typed)
+        split = QSplitter(Qt.Horizontal)
+        split.addWidget(tabs)
+        split.addWidget(desktop)
+        split.setStretchFactor(1, 2)
         layout = QVBoxLayout(self)
-        layout.addWidget(refresh)
-        layout.addWidget(self.queue)
-        layout.addWidget(claim)
+        layout.setContentsMargins(24, 24, 24, 24)
+        settings = QPushButton("Настройки")
+        settings.clicked.connect(lambda: connection_settings(self))
+        header = QHBoxLayout()
+        header.addWidget(title, 1)
+        header.addWidget(settings)
+        layout.addLayout(header)
         layout.addWidget(self.status)
-        layout.addWidget(self.preview)
-        layout.addWidget(self.chat)
-        layout.addWidget(self.chat_line)
-        row = QHBoxLayout()
-        row.addWidget(send)
-        row.addWidget(control)
-        layout.addLayout(row)
-        layout.addWidget(self.steps)
-        layout.addWidget(self.plan_text)
-        layout.addWidget(plan)
-        layout.addWidget(done)
-        layout.addWidget(self.problem)
-        layout.addWidget(nested)
-        layout.addWidget(self.text_input)
-        layout.addWidget(typed)
-        layout.addWidget(self.model_note)
-        layout.addWidget(self.allow_model_input)
-        layout.addWidget(self.model_button)
-        layout.addWidget(close)
-        self.resize(720, 980)
+        layout.addWidget(split, 1)
+        self.setStyleSheet(STYLE)
+        self.resize(1100, 720)
+        self.setMinimumSize(700, 480)
 
     def reload_queue(self) -> None:
-        self.queue.clear()
-        try:
-            tickets = self.api.list_queued()
-        except RuntimeError as exc:
-            self.status.setText(str(exc))
-            return
-        for ticket in tickets:
-            self.queue.addItem(f"{ticket.get('ticket_id')} {ticket.get('description', '')[:80]}")
-        if not tickets:
-            self.status.setText("Очередь пуста")
-
+        def done(tickets):
+            self.queue.clear()
+            for ticket in tickets:
+                self.queue.addItem(f"{ticket.get('ticket_id')} {ticket.get('description', '')[:80]}")
+            if not tickets and not self.ticket_id:
+                self.status.setText("Очередь пуста")
+        self.run_background(self.api.list_queued, done)
     def claim(self) -> None:
+        if self._claiming:
+            return
         item = self.queue.currentItem()
         if item is None:
+            self.status.setText("Выберите заявку")
+            return
+        if self.ticket_id:
+            self.status.setText("Сначала завершите текущую заявку")
             return
         ticket_id = item.text().split()[0]
-        try:
-            claimed = self.api.claim(ticket_id)
-        except RuntimeError as exc:
-            self.status.setText(str(exc))
-            return
-        self.ticket_id = ticket_id
-        self.status.setText(f"Заявка {ticket_id} захвачена")
-        self._sync_player(claimed["account_id"], claimed["tunnel_id"], "assigned")
-
+        self._claiming = True
+        def done(claimed):
+            self._claiming = False
+            self.ticket_id = ticket_id
+            self.status.setText(f"Заявка {ticket_id} захвачена")
+            self._sync_player(claimed["account_id"], claimed["tunnel_id"], "assigned")
+        def failed(error):
+            self._claiming = False
+            self.status.setText(str(error))
+        self.run_background(lambda: self.api.claim(ticket_id), done, failed)
     def _sync_player(self, account_id: str, tunnel_id: str, status: str) -> None:
         if status == "resolved" or not tunnel_id:
             self._stop_play()
             return
-        running = self.player is not None and self.player.state() != QProcess.ProcessState.NotRunning
+        running = self.player is not None and self.player.state() != QProcess.NotRunning
         if account_id and should_open_player(self.playing_tunnel, tunnel_id, running, status):
             self._play(account_id, tunnel_id)
 
@@ -211,34 +246,67 @@ class OperatorWindow(QWidget):
         while len(self.buffer) >= frame_size:
             raw = bytes(self.buffer[:frame_size])
             del self.buffer[:frame_size]
-            image = QImage(raw, FRAME_WIDTH, FRAME_HEIGHT, QImage.Format.Format_RGB888).copy()
+            image = QImage(raw, FRAME_WIDTH, FRAME_HEIGHT, QImage.Format_RGB888).copy()
             self.frame = image
-            self.preview.setPixmap(QPixmap.fromImage(image))
+            self._render_frame()
+
+    def _render_frame(self):
+        if self.frame is not None:
+            pixmap = QPixmap.fromImage(self.frame).scaled(self.preview.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation)
+            self.preview.setPixmap(pixmap)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._render_frame()
 
     def refresh(self) -> None:
-        if not self.ticket_id:
+        if not self.ticket_id or self._polling:
             return
-        try:
-            self.session = self.api.session(self.ticket_id)
-        except RuntimeError as exc:
-            self.status.setText(str(exc))
-            return
+        ticket_id = self.ticket_id
+        self._polling = True
+        def done(session):
+            self._polling = False
+            if self.ticket_id == ticket_id:
+                self.session = session
+                self._show_session()
+        def failed(error):
+            self._polling = False
+            self.status.setText(str(error))
+        self.run_background(lambda: self.api.session(ticket_id), done, failed)
+
+    def _show_session(self) -> None:
         ticket = self.session.get("ticket") or {}
         self._sync_player(ticket.get("account_id") or "", ticket.get("tunnel_id") or "", ticket.get("status") or "")
         self.status.setText(f"{ticket.get('status', '')} · {self.ticket_id}")
+        if ticket.get("status") == "resolved":
+            self.ticket_id = ""
+            self.session = {}
+            self.frame = None
+            self.preview.clear()
+            self.preview.setText("Сеанс завершён")
+            self.status.setText("Заявка завершена")
+            self.reload_queue()
+            return
         lines = [f"{item.get('author')}: {item.get('body')}" for item in self.session.get("messages") or []]
         self.chat.setPlainText("\n".join(lines))
         self.steps.clear()
         for step in self.session.get("steps") or []:
             self.steps.addItem(f"{step.get('status')} {step.get('id')} {step.get('body')}")
-
     def preview_click(self, event) -> None:
         if not self.ticket_id:
+            return
+        if self.frame is None or self.preview.pixmap() is None:
+            return
+        pixmap = self.preview.pixmap()
+        left = (self.preview.width() - pixmap.width()) / 2
+        top = (self.preview.height() - pixmap.height()) / 2
+        x, y = event.pos().x() - left, event.pos().y() - top
+        if x < 0 or y < 0 or x >= pixmap.width() or y >= pixmap.height():
             return
         self._send_input({
             "type": "pointer",
             "intent": "adjust_app_setting",
-            "pointer": {"x": int(event.position().x()), "y": int(event.position().y()), "button": "left", "action": "click"},
+            "pointer": {"x": int(x * FRAME_WIDTH / pixmap.width()), "y": int(y * FRAME_HEIGHT / pixmap.height()), "button": "left", "action": "click"},
         })
 
     def send_text(self) -> None:
@@ -251,19 +319,14 @@ class OperatorWindow(QWidget):
             self._blocked(event.get("intent", ""), reason)
             return
         event["grant_id"] = control.get("grant_id")
-        try:
-            self.api.post_input(self.ticket_id, event)
-        except RuntimeError as exc:
-            self.status.setText(str(exc))
+        ticket_id = self.ticket_id
+        self.run_background(lambda: self.api.post_input(ticket_id, event))
 
     def _blocked(self, intent: str, detail: str) -> None:
         self.status.setText(detail)
-        if self.ticket_id:
-            try:
-                self.api.log_blocked(self.ticket_id, intent or "unknown", detail)
-            except RuntimeError:
-                pass
-
+        ticket_id = self.ticket_id
+        if ticket_id:
+            self.run_background(lambda: self.api.log_blocked(ticket_id, intent or "unknown", detail), failed=lambda _: None)
     def send_chat(self) -> None:
         text = self.chat_line.text().strip()
         if not text or not self.ticket_id:
@@ -313,16 +376,19 @@ class OperatorWindow(QWidget):
             "control": self.session.get("control") or {},
         }
 
-        def progress(text: str) -> None:
-            self.status.setText(text)
-            QApplication.processEvents()
-
-        try:
-            action = next_action(self.models, context, self._png(), progress)
-        except Exception as exc:
-            self.status.setText(f"Модель недоступна: {exc}")
-            return
-        self._apply_model(action)
+        png = self._png()
+        models = self.models
+        ticket_id = self.ticket_id
+        self.model_button.setEnabled(False)
+        self.status.setText("Модель обрабатывает заявку...")
+        def done(action):
+            self.model_button.setEnabled(True)
+            if self.ticket_id == ticket_id:
+                self._apply_model(action)
+        def failed(error):
+            self.model_button.setEnabled(True)
+            self.status.setText(f"Модель недоступна: {error}")
+        self.run_background(lambda: next_action(models, context, png, lambda _: None), done, failed)
 
     def _apply_model(self, action: dict) -> None:
         kind = action.get("action")
@@ -369,19 +435,16 @@ class OperatorWindow(QWidget):
         if self.frame is None:
             return None
         buffer = QBuffer()
-        buffer.open(QIODevice.OpenModeFlag.WriteOnly)
+        buffer.open(QIODevice.WriteOnly)
         self.frame.save(buffer, "PNG")
         return bytes(buffer.data())
 
     def _guarded(self, call) -> None:
-        if not self.ticket_id:
-            return
-        try:
-            call()
-        except RuntimeError as exc:
-            self.status.setText(str(exc))
-
+        if self.ticket_id:
+            self.run_background(call)
     def closeEvent(self, event) -> None:
+        self._closing = True
+        self.timer.stop()
         self._stop_play()
         super().closeEvent(event)
 
