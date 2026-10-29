@@ -4,6 +4,7 @@ from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+from pydantic import BaseModel, ValidationError
 from sqlalchemy import text
 
 from fastapi import FastAPI, Request
@@ -17,10 +18,30 @@ from ticket_service.log import error, info
 from ticket_service.models import Ticket
 from ticket_service.policy import intent_allowed, normalize_scope, scope_allows, text_allowed
 from ticket_service.relay import Relay
+from ticket_service.requests import CameraRequest, CompleteStepRequest, ControlDecision, ResolutionRequest
 from ticket_service.shard import shard_id
 from ticket_service.token import hash_token, new_token
 
 SPEC = Path(__file__).resolve().parents[1] / "openapi.json"
+
+
+class InvalidBody(ValueError):
+    pass
+
+
+async def json_body(request: Request, schema: type[BaseModel] | None = None) -> dict:
+    try:
+        body = await request.json()
+    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+        raise InvalidBody() from exc
+    if not isinstance(body, dict):
+        raise InvalidBody()
+    if schema is not None:
+        try:
+            body.update(schema.model_validate(body).model_dump())
+        except ValidationError as exc:
+            raise InvalidBody() from exc
+    return body
 
 
 @contextmanager
@@ -37,6 +58,10 @@ GRANT_TTL = timedelta(minutes=30)
 def build_app(factory: sessionmaker, creds: Checker, relay: Relay, shard_count: int, swagger_url: str) -> FastAPI:
     app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
     spec = SPEC.read_bytes()
+
+    @app.exception_handler(InvalidBody)
+    async def invalid_body(request: Request, exc: InvalidBody):
+        return JSONResponse({"error": "некорректное тело или тип поля"}, status_code=400)
 
     @app.middleware("http")
     async def access(request: Request, call_next):
@@ -135,10 +160,7 @@ def build_app(factory: sessionmaker, creds: Checker, relay: Relay, shard_count: 
             return who
         if who.role != "client":
             return JSONResponse({"error": "недостаточно прав"}, status_code=403)
-        try:
-            body = await request.json()
-        except json.JSONDecodeError:
-            return JSONResponse({"error": "некорректное тело"}, status_code=400)
+        body = await json_body(request, CameraRequest)
         try:
             account_id = uuid.UUID(str(body.get("account_id", "")))
         except ValueError:
@@ -153,7 +175,7 @@ def build_app(factory: sessionmaker, creds: Checker, relay: Relay, shard_count: 
             account_id=account_id,
             description=description,
             status="queued",
-            camera=bool(body.get("camera")),
+            camera=body["camera"],
             token_hash=hash_token(raw),
         )
         try:
@@ -208,30 +230,32 @@ def build_app(factory: sessionmaker, creds: Checker, relay: Relay, shard_count: 
             return who
         if who.role != "operator":
             return JSONResponse({"error": "недостаточно прав"}, status_code=403)
+        tunnel = None
         with factory() as session:
             located, problem = locate(session, ticket_id)
             if problem:
                 return problem
             found_id, shard = located
             try:
-                ticket = store.get_ticket(session, shard, found_id)
-            except Exception as exc:
-                return fail(exc)
-        try:
-            tunnel = relay.open(ticket.account_id, found_id, ticket.camera)
-        except Exception as exc:
-            error("relay open", err=str(exc))
-            return JSONResponse({"error": "ретранслятор не принял заявку"}, status_code=502)
-        try:
-            with factory() as session:
                 with unit(session):
+                    # Keep the row locked until open and assignment commit together.
+                    # A losing claim must never touch the winner's tunnel.
+                    ticket = store.lock_ticket(session, shard, found_id)
+                    if ticket.status != "queued":
+                        raise store.Conflict()
+                    try:
+                        tunnel = relay.open(ticket.account_id, found_id, ticket.camera)
+                    except Exception as exc:
+                        error("relay open", err=str(exc))
+                        return JSONResponse({"error": "ретранслятор не принял заявку"}, status_code=502)
                     store.claim(session, shard, found_id, who.operator_id, tunnel)
-        except Exception as exc:
-            try:
-                relay.close(found_id)
-            except Exception as close_exc:
-                error("relay close after claim", err=str(close_exc))
-            return fail(exc)
+            except Exception as exc:
+                if tunnel is not None:
+                    try:
+                        relay.close(found_id)
+                    except Exception as close_exc:
+                        error("relay close after claim", err=str(close_exc))
+                return fail(exc)
         info("ticket claimed", ticket_id=str(found_id), tunnel_id=str(tunnel), shard_id=shard)
         return {
             "ticket_id": str(found_id),
@@ -283,11 +307,8 @@ def build_app(factory: sessionmaker, creds: Checker, relay: Relay, shard_count: 
         who = principal(request)
         if isinstance(who, JSONResponse):
             return who
-        try:
-            body = await request.json()
-            intent = str(body.get("intent") or "")
-        except json.JSONDecodeError:
-            intent = "request_control"
+        body = await json_body(request)
+        intent = str(body.get("intent") or "")
         if not intent_allowed(intent):
             return JSONResponse({"error": "намерение запрещено"}, status_code=403)
         with factory() as session:
@@ -318,11 +339,8 @@ def build_app(factory: sessionmaker, creds: Checker, relay: Relay, shard_count: 
             return parsed
         if isinstance(grant, JSONResponse):
             return grant
-        try:
-            body = await request.json()
-        except json.JSONDecodeError:
-            return JSONResponse({"error": "некорректное тело"}, status_code=400)
-        allow = bool(body.get("allow"))
+        body = await json_body(request, ControlDecision)
+        allow = body["allow"]
         scope = "pointer,key,text"
         if allow and str(body.get("scope") or "").strip():
             normalized = normalize_scope(str(body.get("scope")))
@@ -349,10 +367,7 @@ def build_app(factory: sessionmaker, creds: Checker, relay: Relay, shard_count: 
         who = principal(request)
         if isinstance(who, JSONResponse):
             return who
-        try:
-            body = await request.json()
-        except json.JSONDecodeError:
-            return JSONResponse({"error": "некорректное тело"}, status_code=400)
+        body = await json_body(request)
         kind = body.get("type")
         text = str(body.get("text") or "")
         try:
@@ -364,14 +379,13 @@ def build_app(factory: sessionmaker, creds: Checker, relay: Relay, shard_count: 
         parsed = _uuid(ticket_id, "id заявки должен быть uuid")
         if isinstance(parsed, JSONResponse):
             return parsed
-        now = datetime.now(timezone.utc)
         with factory() as session:
             gate = assignee_ticket(session, who, parsed)
             if isinstance(gate, JSONResponse):
                 return gate
             shard, _ticket_row = gate
             try:
-                grant = store.grant_for_input(session, shard, parsed, grant_id, now)
+                grant = store.grant_for_input(session, shard, parsed, grant_id)
             except Exception as exc:
                 return fail(exc)
             if not scope_allows(grant.scope or "", kind):
@@ -396,10 +410,7 @@ def build_app(factory: sessionmaker, creds: Checker, relay: Relay, shard_count: 
             return parsed
         if isinstance(action, JSONResponse):
             return action
-        try:
-            body = await request.json()
-        except json.JSONDecodeError:
-            body = {}
+        body = await json_body(request)
         phase = body.get("phase")
         if phase not in {"applied", "rejected_by_client"}:
             return JSONResponse({"error": "phase должна быть applied или rejected_by_client"}, status_code=400)
@@ -423,10 +434,7 @@ def build_app(factory: sessionmaker, creds: Checker, relay: Relay, shard_count: 
         who = principal(request)
         if isinstance(who, JSONResponse):
             return who
-        try:
-            body = await request.json()
-        except json.JSONDecodeError:
-            body = {}
+        body = await json_body(request)
         intent = str(body.get("intent") or "").strip()
         if not intent:
             return JSONResponse({"error": "нужно намерение"}, status_code=400)
@@ -450,11 +458,8 @@ def build_app(factory: sessionmaker, creds: Checker, relay: Relay, shard_count: 
         who = principal(request)
         if isinstance(who, JSONResponse):
             return who
-        try:
-            body = await request.json()
-            raw_steps = body.get("steps") or []
-        except json.JSONDecodeError:
-            raw_steps = []
+        body = await json_body(request)
+        raw_steps = body.get("steps") or []
         if not isinstance(raw_steps, list) or not raw_steps or len(raw_steps) > 20:
             return JSONResponse({"error": "нужен хотя бы один шаг и не больше 20"}, status_code=400)
         cleaned = []
@@ -485,10 +490,7 @@ def build_app(factory: sessionmaker, creds: Checker, relay: Relay, shard_count: 
             return who
         if who.role != "client":
             return JSONResponse({"error": "это действие клиента"}, status_code=403)
-        try:
-            body = await request.json()
-        except json.JSONDecodeError:
-            body = {}
+        body = await json_body(request)
         text = str(body.get("body") or "").strip()
         if not text or not text_allowed(text):
             return JSONResponse({"error": "наблюдение пустое или запрещено"}, status_code=400)
@@ -518,10 +520,7 @@ def build_app(factory: sessionmaker, creds: Checker, relay: Relay, shard_count: 
         who = principal(request)
         if isinstance(who, JSONResponse):
             return who
-        try:
-            body = await request.json()
-        except json.JSONDecodeError:
-            body = {}
+        body = await json_body(request, CompleteStepRequest)
         parsed = _uuid(ticket_id, "id заявки должен быть uuid")
         step = _uuid(step_id, "step должен быть uuid")
         if isinstance(parsed, JSONResponse):
@@ -535,7 +534,7 @@ def build_app(factory: sessionmaker, creds: Checker, relay: Relay, shard_count: 
             shard, _ticket_row = gate
             try:
                 with unit(session):
-                    store.complete_step(session, shard, parsed, step, bool(body.get("seen_on_screen")), str(body.get("body") or "").strip())
+                    store.complete_step(session, shard, parsed, step, body["seen_on_screen"], str(body.get("body") or "").strip())
             except Exception as exc:
                 return fail(exc)
         return {"status": "done"}
@@ -545,10 +544,7 @@ def build_app(factory: sessionmaker, creds: Checker, relay: Relay, shard_count: 
         who = principal(request)
         if isinstance(who, JSONResponse):
             return who
-        try:
-            body = await request.json()
-        except json.JSONDecodeError:
-            body = {}
+        body = await json_body(request)
         text = str(body.get("body") or "").strip()
         if not text_allowed(text):
             return JSONResponse({"error": "новый текст шага запрещён"}, status_code=403)
@@ -575,10 +571,7 @@ def build_app(factory: sessionmaker, creds: Checker, relay: Relay, shard_count: 
         who = principal(request)
         if isinstance(who, JSONResponse):
             return who
-        try:
-            body = await request.json()
-        except json.JSONDecodeError:
-            return JSONResponse({"error": "некорректное тело"}, status_code=400)
+        body = await json_body(request)
         steps = body.get("steps") or []
         description = str(body.get("description") or "").strip()
         try:
@@ -609,11 +602,8 @@ def build_app(factory: sessionmaker, creds: Checker, relay: Relay, shard_count: 
         who = principal(request)
         if isinstance(who, JSONResponse):
             return who
-        try:
-            body = await request.json()
-        except json.JSONDecodeError:
-            return JSONResponse({"error": "некорректное тело"}, status_code=400)
-        accept = bool(body.get("accept"))
+        body = await json_body(request, ResolutionRequest)
+        accept = body["accept"]
         comment = str(body.get("comment") or "").strip()
         parsed = _uuid(ticket_id, "id заявки должен быть uuid")
         if isinstance(parsed, JSONResponse):
@@ -673,10 +663,7 @@ def build_app(factory: sessionmaker, creds: Checker, relay: Relay, shard_count: 
             return await writer(session, shard, found_id, who, request)
 
     async def _message_body(session, shard, found_id, who, request: Request):
-        try:
-            body = await request.json()
-        except json.JSONDecodeError:
-            return JSONResponse({"error": "некорректное тело"}, status_code=400)
+        body = await json_body(request)
         text = str(body.get("body") or "").strip()
         if not text or len(text) > 4000 or not text_allowed(text):
             return JSONResponse({"error": "сообщение пустое, слишком длинное или запрещено правилами"}, status_code=400)

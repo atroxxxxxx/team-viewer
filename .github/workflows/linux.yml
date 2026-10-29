@@ -1,0 +1,32 @@
+name: Linux
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  ticket-service:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y python3-venv postgresql-16
+      - name: Set up environment
+        run: sh dev.sh setup --postgres
+      - name: Start project database
+        run: sh dev.sh db-start
+      - name: Run tests
+        run: sh dev.sh test -q
+      - name: Check dependencies and sources
+        run: sh dev.sh check
+      - name: Stop project database
+        if: always()
+        run: |
+          if [ -f .dev/pgdata/postmaster.pid ]; then
+            sh dev.sh db-stop
+          fi

@@ -9,6 +9,9 @@
 *.log
 __pycache__/
 .venv/
+.dev/
+.env.dev
+.pytest_cache/
 .state/
 /operator-app/models/
 vendor/

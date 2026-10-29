@@ -63,6 +63,21 @@ def get_ticket(session: Session, shard_id: int, ticket_id: uuid.UUID) -> Ticket:
     return ticket
 
 
+def lock_ticket(session: Session, shard_id: int, ticket_id: uuid.UUID) -> Ticket:
+    # Refresh an already loaded row after waiting for another transaction.
+    ticket = session.scalar(
+        select(Ticket)
+        .where(Ticket.shard_id == shard_id, Ticket.id == ticket_id)
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    )
+    if ticket is None:
+        raise NotFound()
+    if ticket.status == "resolved":
+        raise Conflict()
+    return ticket
+
+
 def claim(session: Session, shard_id: int, ticket_id: uuid.UUID, operator_id: uuid.UUID, tunnel_id: uuid.UUID) -> None:
     result = session.execute(
         update(Ticket)
@@ -76,6 +91,7 @@ def claim(session: Session, shard_id: int, ticket_id: uuid.UUID, operator_id: uu
 
 
 def add_message(session: Session, shard_id: int, ticket_id: uuid.UUID, author: str, body: str) -> None:
+    lock_ticket(session, shard_id, ticket_id)
     session.add(ChatMessage(shard_id=shard_id, id=uuid.uuid4(), ticket_id=ticket_id, author=author, body=body))
     _action(session, shard_id, ticket_id, author, "chat", "applied")
 
@@ -89,6 +105,7 @@ def messages(session: Session, shard_id: int, ticket_id: uuid.UUID) -> list[Chat
 
 
 def request_control(session: Session, shard_id: int, ticket_id: uuid.UUID, intent: str) -> uuid.UUID:
+    lock_ticket(session, shard_id, ticket_id)
     result = session.execute(
         update(Ticket)
         .where(Ticket.shard_id == shard_id, Ticket.id == ticket_id, Ticket.status.in_(("assigned", "guided", "remote_control")))
@@ -103,13 +120,13 @@ def request_control(session: Session, shard_id: int, ticket_id: uuid.UUID, inten
 
 
 def decide_control(session: Session, shard_id: int, ticket_id: uuid.UUID, grant_id: uuid.UUID, allow: bool, scope: str, ttl: timedelta) -> None:
+    ticket = lock_ticket(session, shard_id, ticket_id)
     grant = session.get(ControlGrant, (shard_id, grant_id))
     if grant is None or grant.ticket_id != ticket_id or grant.status != "pending":
         raise Conflict()
     grant.status = "active" if allow else "denied"
     grant.scope = scope
     grant.expires_at = datetime.now(timezone.utc) + ttl if allow else None
-    ticket = get_ticket(session, shard_id, ticket_id)
     ticket.status = "remote_control" if allow else "guided"
     _action(session, shard_id, ticket_id, "client", "control_decision", "applied" if allow else "rejected_by_client")
 
@@ -118,7 +135,9 @@ def grants_for(session: Session, shard_id: int, ticket_id: uuid.UUID) -> list[Co
     return list(session.scalars(select(ControlGrant).where(ControlGrant.shard_id == shard_id, ControlGrant.ticket_id == ticket_id)))
 
 
-def grant_for_input(session: Session, shard_id: int, ticket_id: uuid.UUID, grant_id: uuid.UUID, now: datetime) -> ControlGrant:
+def grant_for_input(session: Session, shard_id: int, ticket_id: uuid.UUID, grant_id: uuid.UUID) -> ControlGrant:
+    lock_ticket(session, shard_id, ticket_id)
+    now = datetime.now(timezone.utc)
     grant = session.get(ControlGrant, (shard_id, grant_id))
     if grant is None or grant.ticket_id != ticket_id or not usable(grant, now):
         raise Conflict()
@@ -144,6 +163,7 @@ def propose_input(session: Session, shard_id: int, ticket_id: uuid.UUID, grant: 
 
 
 def finish_input(session: Session, shard_id: int, ticket_id: uuid.UUID, action_id: uuid.UUID, phase: str, observation: str) -> None:
+    lock_ticket(session, shard_id, ticket_id)
     result = session.execute(
         update(ActionLog)
         .where(ActionLog.shard_id == shard_id, ActionLog.id == action_id, ActionLog.ticket_id == ticket_id, ActionLog.phase == "proposed")
@@ -156,6 +176,7 @@ def finish_input(session: Session, shard_id: int, ticket_id: uuid.UUID, action_i
 
 
 def log_blocked(session: Session, shard_id: int, ticket_id: uuid.UUID, actor: str, intent: str, detail: dict) -> None:
+    lock_ticket(session, shard_id, ticket_id)
     session.add(
         ActionLog(
             shard_id=shard_id,
@@ -170,6 +191,7 @@ def log_blocked(session: Session, shard_id: int, ticket_id: uuid.UUID, actor: st
 
 
 def create_plan(session: Session, shard_id: int, ticket_id: uuid.UUID, problem_id: uuid.UUID | None, steps: list[str]) -> uuid.UUID:
+    lock_ticket(session, shard_id, ticket_id)
     plan_id = uuid.uuid4()
     session.add(Plan(shard_id=shard_id, id=plan_id, ticket_id=ticket_id, problem_id=problem_id))
     # Шаг ссылается на план. План должен уже быть в транзакции, иначе внешний ключ не видит его.
@@ -192,6 +214,7 @@ def steps(session: Session, shard_id: int, ticket_id: uuid.UUID) -> list[PlanSte
 
 
 def add_observation(session: Session, shard_id: int, ticket_id: uuid.UUID, step_id: uuid.UUID, body: str) -> None:
+    lock_ticket(session, shard_id, ticket_id)
     step = session.get(PlanStep, (shard_id, step_id))
     if step is None or step.ticket_id != ticket_id:
         raise NotFound()
@@ -199,6 +222,7 @@ def add_observation(session: Session, shard_id: int, ticket_id: uuid.UUID, step_
 
 
 def complete_step(session: Session, shard_id: int, ticket_id: uuid.UUID, step_id: uuid.UUID, seen: bool, body: str) -> None:
+    lock_ticket(session, shard_id, ticket_id)
     if seen:
         add_observation(session, shard_id, ticket_id, step_id, "вижу на экране: " + body)
         session.flush()
@@ -219,6 +243,7 @@ def complete_step(session: Session, shard_id: int, ticket_id: uuid.UUID, step_id
 
 
 def revise_step(session: Session, shard_id: int, ticket_id: uuid.UUID, step_id: uuid.UUID, body: str) -> None:
+    lock_ticket(session, shard_id, ticket_id)
     step = session.get(PlanStep, (shard_id, step_id))
     if step is None or step.ticket_id != ticket_id or step.status != "todo":
         raise Conflict()
@@ -228,6 +253,7 @@ def revise_step(session: Session, shard_id: int, ticket_id: uuid.UUID, step_id: 
 
 
 def add_problem(session: Session, shard_id: int, ticket_id: uuid.UUID, parent_step: uuid.UUID, description: str, plan_steps: list[str]) -> uuid.UUID:
+    lock_ticket(session, shard_id, ticket_id)
     problem_id = uuid.uuid4()
     session.add(Problem(shard_id=shard_id, id=problem_id, ticket_id=ticket_id, parent_step_id=parent_step, description=description))
     result = session.execute(
@@ -243,12 +269,12 @@ def add_problem(session: Session, shard_id: int, ticket_id: uuid.UUID, parent_st
 
 
 def confirm(session: Session, shard_id: int, ticket_id: uuid.UUID, role: str, accept: bool, now: datetime) -> str:
+    ticket = lock_ticket(session, shard_id, ticket_id)
     session.add(Confirmation(shard_id=shard_id, id=uuid.uuid4(), ticket_id=ticket_id, role=role, accept=accept))
     session.flush()
-    ticket = get_ticket(session, shard_id, ticket_id)
     if not accept:
         active, _ = pick_controls(grants_for(session, shard_id, ticket_id), now)
-        ticket.status = "remote_control" if active is not None else "guided"
+        ticket.status = "remote_control" if active is not None and usable(active, now) else "guided"
         return ticket.status
     open_steps = session.scalar(
         select(func.count()).select_from(PlanStep).where(
@@ -263,6 +289,25 @@ def confirm(session: Session, shard_id: int, ticket_id: uuid.UUID, role: str, ac
     client_yes = _latest_accept(session, shard_id, ticket_id, "client")
     status = "resolved" if operator_yes and client_yes else "awaiting_client"
     if status == "resolved":
+        session.execute(
+            update(ControlGrant)
+            .where(
+                ControlGrant.shard_id == shard_id,
+                ControlGrant.ticket_id == ticket_id,
+                ControlGrant.status.in_(("active", "pending")),
+            )
+            .values(status="revoked", scope="", expires_at=now)
+        )
+        session.execute(
+            update(ActionLog)
+            .where(
+                ActionLog.shard_id == shard_id,
+                ActionLog.ticket_id == ticket_id,
+                ActionLog.phase == "proposed",
+                ActionLog.detail["type"].astext.in_(("pointer", "key", "text")),
+            )
+            .values(phase="cancelled")
+        )
         session.execute(
             update(ChatMember)
             .where(
