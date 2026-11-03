@@ -1,6 +1,12 @@
-import json
+import logging
+import threading
+import time
 
 import httpx
+
+from support_protocol.errors import ServiceUnavailable, TicketError
+
+log = logging.getLogger(__name__)
 
 
 class TicketAPI:
@@ -10,6 +16,9 @@ class TicketAPI:
         self.password = password
         self.verify = verify
         self.ticket_token = ""
+        self._log_lock = threading.Lock()
+        self._last_error = None
+        self._last_error_at = 0.0
 
     def _url(self, path: str) -> str:
         return self.base + path
@@ -83,29 +92,50 @@ class TicketAPI:
             {"role": role, "accept": accept, "comment": comment},
         )
 
+    def health(self):
+        return self._json("GET", "/health")
+
+    def _log_failure(self, error):
+        # Периодический опрос не должен заполнять журнал одинаковыми traceback.
+        key = (type(error), str(error))
+        with self._log_lock:
+            now = time.monotonic()
+            if key != self._last_error or now - self._last_error_at >= 30:
+                log.error("Ticket service request failed", exc_info=(type(error), error, error.__traceback__))
+                self._last_error, self._last_error_at = key, now
+
     def _json(self, method: str, path: str, body: dict | None = None) -> dict:
         headers = {}
         if self.ticket_token:
             headers["X-Ticket-Token"] = self.ticket_token
         try:
             response = httpx.request(
-                method,
-                self._url(path),
-                json=body,
-                auth=(self.username, self.password),
-                headers=headers,
-                timeout=15,
+                method, self._url(path), json=body, auth=(self.username, self.password),
+                # Принятие и закрытие заявки включают запрос к relay (до 5 с).
+                # Сохраняем прежний бюджет POST, иначе сервер может уже изменить
+                # заявку после того, как GUI перестал ждать результат.
+                headers=headers, timeout=httpx.Timeout(3.0, connect=1.5, read=15.0 if method == "POST" else 3.0),
                 verify=self.verify,
             )
-        except httpx.HTTPError as exc:
-            raise RuntimeError(f"сервис заявок недоступен: {exc}") from exc
-        if response.status_code >= 400:
-            message = response.text
-            try:
-                message = response.json().get("error", message)
-            except json.JSONDecodeError:
-                pass
-            raise RuntimeError(message)
-        if not response.content:
-            return {}
-        return response.json()
+            response.raise_for_status()
+            result = response.json() if response.content else {}
+            if not isinstance(result, dict):
+                raise ValueError("expected JSON object from ticket service")
+        except httpx.HTTPStatusError as exc:
+            self._log_failure(exc)
+            code = exc.response.status_code
+            if code >= 500:
+                raise ServiceUnavailable() from exc
+            messages = {
+                401: "Не удалось войти. Проверьте учётные данные в конфигурации.",
+                403: "Нет разрешения на это действие.",
+                404: "Заявка или ресурс не найдены.",
+                409: "Состояние заявки изменилось. Обновите данные и повторите действие.",
+            }
+            raise TicketError(messages.get(code, "Сервис отклонил запрос. Проверьте введённые данные.")) from exc
+        except (httpx.HTTPError, ValueError) as exc:
+            self._log_failure(exc)
+            raise ServiceUnavailable() from exc
+        with self._log_lock:
+            self._last_error = None
+        return result

@@ -18,6 +18,6 @@ operator_app = "operator-app/operator_app"
 
 [tool.pytest.ini_options]
 testpaths = ["ticket-service/tests", "support-protocol/tests", "operator-app/tests", "scripts/tests"]
-pythonpath = ["ticket-service", "support-protocol", "operator-app"]
+pythonpath = ["ticket-service", "support-protocol", "operator-app", "client-app"]
 cache_dir = ".dev/pytest-cache"
 markers = ["integration: requires TEST_DATABASE_URL pointing to a disposable PostgreSQL database"]

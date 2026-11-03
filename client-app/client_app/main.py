@@ -7,10 +7,13 @@ if _protocol.is_dir():
 
 from PyQt5.QtWidgets import QApplication
 
+from support_protocol.log import configure
+
 from client_app.window import ClientWindow
 
 
 def main() -> None:
+    configure("client")
     app = QApplication(sys.argv)
     window = ClientWindow()
     window.show()
