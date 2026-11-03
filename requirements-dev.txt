@@ -2,3 +2,4 @@
 -r ticket-service/requirements.txt
 pytest
 python-dotenv
+PyYAML
