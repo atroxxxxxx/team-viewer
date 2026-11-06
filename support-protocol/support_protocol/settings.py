@@ -7,6 +7,10 @@ import tempfile
 from pathlib import Path
 from urllib.parse import urlsplit
 
+from support_protocol.media import DEFAULT_FPS, valid_fps
+
+SETTINGS_VERSION = 3
+
 log = logging.getLogger(__name__)
 
 
@@ -48,7 +52,7 @@ VALIDATORS = {
     "geometry": lambda v: isinstance(v, str) and len(v) <= 4096,
     "splitter": lambda v: isinstance(v, str) and len(v) <= 4096,
     "tab": lambda v: type(v) is int and 0 <= v <= 3,
-    "video_fps": lambda v: type(v) is int and 5 <= v <= 30,
+    "video_fps": valid_fps,
     "video_crf": lambda v: type(v) is int and 18 <= v <= 35,
 }
 
@@ -59,19 +63,32 @@ class UserSettings:
             raise ValueError("unknown desktop role")
         self.path = config_dir() / f"{role}.json"
         self.values = {}
+        migrate_video = False
         try:
             data = json.loads(self.path.read_text(encoding="utf-8"))
             # Старый плоский формат также принимается. Неизвестные версии не перезаписываются при чтении.
-            if not isinstance(data, dict) or data.get("version", 1) != 1:
+            if not isinstance(data, dict) or data.get("version", 1) not in (1, 2, SETTINGS_VERSION):
                 raise ValueError("unsupported settings format")
             values = data.get("values", data)
             if not isinstance(values, dict):
                 raise ValueError("invalid settings values")
             self.values = {k: v for k, v in values.items() if k in VALIDATORS and VALIDATORS[k](v)}
+            # Старые профили сохраняли частоту в пределах 30 FPS.
+            # Обновление убирает это ограничение и применяет новый дефолт.
+            # Любая явно выбранная частота в новом профиле сохраняется.
+            migrate_video = (role == "client" and data.get("version", 1) < SETTINGS_VERSION and
+                             "video_fps" in self.values and self.values["video_fps"] < DEFAULT_FPS)
         except FileNotFoundError:
             log.debug("User settings not created yet")
         except (OSError, ValueError, TypeError):
             log.warning("Cannot read user settings; keeping base configuration", exc_info=True)
+
+        if migrate_video:
+            self.values["video_fps"] = DEFAULT_FPS
+            try:
+                self.update()
+            except OSError:
+                log.warning("Cannot persist FPS profile migration; using the new default for this run", exc_info=True)
 
     def get(self, key, default=None):
         return self.values.get(key, default)
@@ -84,7 +101,7 @@ class UserSettings:
         fd, temporary = tempfile.mkstemp(dir=self.path.parent, suffix=".tmp")
         try:
             with os.fdopen(fd, "w", encoding="utf-8") as stream:
-                json.dump({"version": 1, "values": updated}, stream, ensure_ascii=False)
+                json.dump({"version": SETTINGS_VERSION, "values": updated}, stream, ensure_ascii=False)
                 stream.flush()
                 os.fsync(stream.fileno())
             os.replace(temporary, self.path)

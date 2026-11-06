@@ -430,3 +430,99 @@ print("exited", flush=True)
     result = subprocess.run([sys.executable, "-c", program], env=environment, capture_output=True, text=True, timeout=3)
     assert result.returncode == 0, result.stderr
     assert "exited" in result.stdout
+
+
+def test_new_frames_are_presented_on_demand_without_periodic_rate_limit(app, windows):
+    _, o = windows
+    assert o.render_timer.isSingleShot() and o.render_timer.interval() == 0
+    assert not o.render_timer.isActive()
+    frame_size = 640 * 360 * 3
+    class Player:
+        def readAllStandardOutput(self):
+            return b"\x07" * frame_size
+    o.player = Player()
+    o._read_frame()
+    assert o.render_timer.isActive()
+    pump(app, lambda: o._pending_frame is None)
+    assert o.frame.pixelColor(0, 0).red() == 7
+    assert not o.render_timer.isActive()
+    o.player = None
+
+
+def test_fps_counter_counts_new_painted_frames_only(app, windows):
+    from PyQt5.QtGui import QImage
+    c, o = windows
+    o.show()
+    app.processEvents()
+    o.frame = QImage(640, 360, QImage.Format_RGB888)
+    o.frame.fill(Qt.black)
+    o._render_frame()
+    pump(app, lambda: len(o._frame_times) == 1)
+    for _ in range(4):
+        o.preview.update()
+        app.processEvents()
+    o._render_frame()  # resize-style rescale of the same frame must not add FPS
+    app.processEvents()
+    assert len(o._frame_times) == 1
+
+
+def test_fps_label_uses_measured_rate_and_expires(windows, monkeypatch):
+    from types import SimpleNamespace
+    _, o = windows
+    clock = [0.0]
+    monkeypatch.setattr(operator_module, "time", SimpleNamespace(monotonic=lambda: clock[0]))
+    for index in range(61):
+        clock[0] = index / 30
+        o._record_video_frame()
+    o._update_video_rate()
+    assert o.video_rate.text() == "30 FPS"
+    clock[0] += 3
+    o._update_video_rate()
+    assert o.video_rate.text() == "— FPS"
+
+
+def test_client_publishes_60_after_loading_old_15_profile(app, monkeypatch, tmp_path):
+    import json
+    from support_protocol.media import DEFAULT_FPS
+    monkeypatch.setenv("SUPPORT_SETTINGS_DIR", str(tmp_path))
+    monkeypatch.setattr(client_module, "STATE", tmp_path / "id")
+    monkeypatch.setattr(TicketAPI, "health", lambda _: {})
+    (tmp_path / "client.json").write_text(json.dumps({"version": 1, "values": {"video_fps": 15}}))
+    client = client_module.ClientWindow()
+    try:
+        captured = []
+        monkeypatch.setattr(client_module, "publish_args", lambda *a, **kw: captured.append(kw) or ["not-started"])
+        class Process:
+            def __init__(self, *_):
+                self.finished = SimpleSignal()
+                self.errorOccurred = SimpleSignal()
+            def start(self, *_): pass
+            def kill(self): pass
+            def deleteLater(self): pass
+        class SimpleSignal:
+            def connect(self, *_): pass
+        monkeypatch.setattr(client_module, "QProcess", Process)
+        client._publish("screen", "rtsp://localhost/stream", 0, "screen")
+        assert captured[0]["fps"] == DEFAULT_FPS == 60
+    finally:
+        client.close()
+
+
+@pytest.mark.parametrize("fps", [60, 144, 1000])
+def test_fps_dialog_accepts_user_rate_above_previous_cap(app, windows, fps):
+    from PyQt5.QtCore import QTimer
+    from PyQt5.QtWidgets import QDialogButtonBox, QFormLayout, QLineEdit
+    from support_protocol.ui import connection_settings
+    c, _ = windows
+    pump(app, lambda: not c._tasks)
+    def apply():
+        dialog = app.activeModalWidget()
+        form = dialog.findChild(QFormLayout)
+        field = form.itemAt(4, QFormLayout.FieldRole).widget()
+        assert isinstance(field, QLineEdit)
+        assert field.text() == "60"
+        field.setText(str(fps))
+        dialog.findChild(QDialogButtonBox).button(QDialogButtonBox.Save).click()
+    QTimer.singleShot(0, apply)
+    connection_settings(c)
+    assert UserSettings("client").get("video_fps") == fps

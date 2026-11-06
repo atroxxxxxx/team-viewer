@@ -25,7 +25,7 @@ from support_protocol.ui import Background, STYLE, connection_settings, card, he
 from support_protocol.settings import UserSettings
 from support_protocol.api import TicketAPI
 from support_protocol.endpoints import config_file, load_endpoints
-from support_protocol.media import FRAME_HEIGHT, FRAME_WIDTH, media_action, publish_args
+from support_protocol.media import FRAME_HEIGHT, FRAME_WIDTH, DEFAULT_FPS, media_action, publish_args
 from support_protocol.policy import validate_input
 from support_protocol.tunnel import LocalRTSPBridge
 
@@ -201,7 +201,7 @@ class ClientWindow(QWidget, Background):
     def _publish(self, mode: str, url: str, gen: int, role: str) -> QProcess | None:
         try:
             args = publish_args(url, mode, os.environ.get("DISPLAY", ":0"),
-                                fps=self.settings.get("video_fps", 15), crf=self.settings.get("video_crf", 23))
+                                fps=self.settings.get("video_fps", DEFAULT_FPS), crf=self.settings.get("video_crf", 23))
         except RuntimeError as exc:
             self.status.setText(str(exc))
             return None

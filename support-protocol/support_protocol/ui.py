@@ -3,6 +3,7 @@ import logging
 import threading
 
 from PyQt5.QtCore import QObject, QRunnable, QThreadPool, QTimer, QEvent, QByteArray, pyqtSignal, pyqtSlot
+from support_protocol.media import DEFAULT_FPS, valid_fps
 from support_protocol.errors import TicketError, ServiceUnavailable, user_message
 
 log = logging.getLogger(__name__)
@@ -120,9 +121,15 @@ class StatusLabel(QLabel):
 
 
 class DesktopPreview(QLabel):
+    framePainted = pyqtSignal()
+
     def paintEvent(self, event):
         if self.pixmap() is not None:
             super().paintEvent(event)
+            frame_id = getattr(self, "frame_id", None)
+            if frame_id is not None and frame_id != getattr(self, "_painted_frame", None):
+                self._painted_frame = frame_id
+                self.framePainted.emit()
             return
         painter = QPainter(self)
         painter.setRenderHint(QPainter.Antialiasing)
@@ -382,9 +389,11 @@ def _connection_settings(parent):
     form.addRow(verify)
     fps, crf = None, None
     if hasattr(parent, "camera"):
-        fps, crf = QSpinBox(), QSpinBox()
-        fps.setRange(5, 30)
-        fps.setValue(parent.settings.get("video_fps", 15))
+        from PyQt5.QtCore import QRegularExpression
+        from PyQt5.QtGui import QRegularExpressionValidator
+        fps, crf = QLineEdit(), QSpinBox()
+        fps.setValidator(QRegularExpressionValidator(QRegularExpression("[1-9][0-9]*"), fps))
+        fps.setText(str(parent.settings.get("video_fps", DEFAULT_FPS)))
         crf.setRange(18, 35)
         crf.setValue(parent.settings.get("video_crf", 23))
         form.addRow("Кадров в секунду", fps)
@@ -405,7 +414,14 @@ def _connection_settings(parent):
     values = dict(api_base=address.text().strip().rstrip("/"), tls_verify=verify.isChecked(),
                   relay_host=host.text().strip(), relay_port=port.value())
     if fps is not None:
-        values.update(video_fps=fps.value(), video_crf=crf.value())
+        try:
+            requested_fps = int(fps.text())
+            if not valid_fps(requested_fps):
+                raise ValueError("FPS must be positive")
+        except ValueError:
+            QMessageBox.warning(parent, "Настройки", "Введите целое число кадров в секунду больше нуля.")
+            return
+        values.update(video_fps=requested_fps, video_crf=crf.value())
     if not parent.save_preferences(**values):
         return
     parent.api.base = values["api_base"]

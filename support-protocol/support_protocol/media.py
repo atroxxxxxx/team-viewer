@@ -2,6 +2,7 @@ import shutil
 
 FRAME_WIDTH = 640
 FRAME_HEIGHT = 360
+DEFAULT_FPS = 60
 
 
 def ffmpeg_path() -> str:
@@ -11,8 +12,12 @@ def ffmpeg_path() -> str:
     return path
 
 
-def publish_args(url: str, mode: str, display: str, *, fps: int = 15, crf: int = 23) -> list[str]:
-    if not 5 <= fps <= 30 or not 18 <= crf <= 35:
+def valid_fps(value) -> bool:
+    return type(value) is int and value > 0
+
+
+def publish_args(url: str, mode: str, display: str, *, fps: int = DEFAULT_FPS, crf: int = 23) -> list[str]:
+    if not valid_fps(fps) or not 18 <= crf <= 35:
         raise ValueError("unsupported video settings")
     ffmpeg = ffmpeg_path()
     output = [
@@ -46,7 +51,7 @@ def play_args(url: str) -> list[str]:
         ffmpeg_path(), "-loglevel", "error", "-rtsp_transport", "tcp", "-timeout", "5000000",
         "-probesize", "32768", "-analyzeduration", "100000",
         "-fflags", "nobuffer", "-flags", "low_delay", "-threads", "1", "-i", url,
-        "-an", "-sn", "-dn", "-fps_mode", "passthrough", "-flush_packets", "1",
+        "-an", "-sn", "-dn", "-threads:v", "1", "-fps_mode", "passthrough", "-flush_packets", "1",
         "-f", "rawvideo", "-pix_fmt", "rgb24", "-",
     ]
 

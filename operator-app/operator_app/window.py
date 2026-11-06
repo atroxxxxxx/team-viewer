@@ -1,4 +1,6 @@
 import uuid
+import time
+from collections import deque
 import base64
 import logging
 from pathlib import Path
@@ -55,6 +57,7 @@ class OperatorWindow(QWidget, Background):
         self.buffer = bytearray()
         self.frame: QImage | None = None
         self._pending_frame = None
+        self._frame_times = deque(maxlen=120)
         self._player_stderr = ""
         self.init_background()
         self._polling = False
@@ -62,11 +65,13 @@ class OperatorWindow(QWidget, Background):
         self._build()
         self.timer = QTimer(self)
         self.timer.timeout.connect(self.refresh)
+        self.timer.timeout.connect(self._update_video_rate)
         self.timer.start(1000)
         self.render_timer = QTimer(self)
-        self.render_timer.setInterval(33)
+        self.render_timer.setSingleShot(True)
+        self.render_timer.setInterval(0)
+        self.render_timer.setTimerType(Qt.PreciseTimer)
         self.render_timer.timeout.connect(self._present_frame)
-        self.render_timer.start()
         self.queue_timer = QTimer(self)
         self.queue_timer.setInterval(3000)
         self.queue_timer.timeout.connect(self.reload_queue)
@@ -82,6 +87,7 @@ class OperatorWindow(QWidget, Background):
         self.preview.setFixedSize(FRAME_WIDTH, FRAME_HEIGHT)
         self.preview.setAlignment(Qt.AlignCenter)
         self.preview.mousePressEvent = self.preview_click
+        self.preview.framePainted.connect(self._record_video_frame)
         self.chat = QPlainTextEdit()
         self.chat.setReadOnly(True)
         self.chat_line = QLineEdit()
@@ -183,7 +189,11 @@ class OperatorWindow(QWidget, Background):
 
         desktop, desktop_layout = card()
         desktop_layout.addWidget(label("УДАЛЁННОЕ УСТРОЙСТВО", "eyebrow"))
-        desktop_layout.addWidget(label("Экран клиента", "cardTitle"))
+        video_heading = QHBoxLayout()
+        video_heading.addWidget(label("Экран клиента", "cardTitle"), 1)
+        self.video_rate = label("— FPS", "muted")
+        video_heading.addWidget(self.video_rate)
+        desktop_layout.addLayout(video_heading)
         viewport, viewport_layout = card("viewport", 12, 0)
         viewport_layout.addWidget(self.preview, 1)
         desktop_layout.addWidget(viewport, 1)
@@ -266,6 +276,9 @@ class OperatorWindow(QWidget, Background):
             player.finished.connect(player.deleteLater)
             player.kill()
         self._pending_frame = None
+        self.render_timer.stop()
+        self._frame_times.clear()
+        self.video_rate.setText("— FPS")
         self.frame = None
         self.buffer.clear()
         self.preview.clear()
@@ -315,6 +328,9 @@ class OperatorWindow(QWidget, Background):
             log.error("FFmpeg player stopped: %s", err)
         self.frame = None
         self._pending_frame = None
+        self.render_timer.stop()
+        self._frame_times.clear()
+        self.video_rate.setText("— FPS")
         self.preview.clear()
         self.preview.setText("Поток прерван. Повторное подключение...")
 
@@ -324,8 +340,12 @@ class OperatorWindow(QWidget, Background):
         raw = latest_frame(self.buffer, bytes(self.player.readAllStandardOutput()), FRAME_WIDTH * FRAME_HEIGHT * 3)
         if raw is not None:
             self._pending_frame = raw
+            # Один отложенный показ на пакет кадров, без второго FPS-ограничителя.
+            if not self.render_timer.isActive():
+                self.render_timer.start()
 
     def _present_frame(self):
+        self.render_timer.stop()
         if self._pending_frame is None:
             return
         raw, self._pending_frame = self._pending_frame, None
@@ -335,7 +355,19 @@ class OperatorWindow(QWidget, Background):
     def _render_frame(self):
         if self.frame is not None:
             pixmap = QPixmap.fromImage(self.frame).scaled(self.preview.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation)
+            self.preview.frame_id = self.frame.cacheKey()
             self.preview.setPixmap(pixmap)
+
+    def _record_video_frame(self):
+        self._frame_times.append(time.monotonic())
+
+    def _update_video_rate(self):
+        if len(self._frame_times) < 2 or time.monotonic() - self._frame_times[-1] > 2:
+            self.video_rate.setText("— FPS")
+            return
+        elapsed = self._frame_times[-1] - self._frame_times[0]
+        fps = (len(self._frame_times) - 1) / elapsed if elapsed > 0 else 0
+        self.video_rate.setText(f"{fps:.0f} FPS")
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
