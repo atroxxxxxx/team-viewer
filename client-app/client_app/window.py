@@ -9,6 +9,8 @@ from client_app.input_session import InputSession
 
 from PyQt5.QtCore import QProcess, QTimer, Qt
 from PyQt5.QtWidgets import (
+    QDialog,
+    QDialogButtonBox,
     QFormLayout,
     QHBoxLayout,
     QLabel,
@@ -25,7 +27,7 @@ from support_protocol.ui import Background, STYLE, connection_settings, card, he
 from support_protocol.settings import UserSettings
 from support_protocol.api import TicketAPI
 from support_protocol.endpoints import config_file, load_endpoints
-from support_protocol.media import FRAME_HEIGHT, FRAME_WIDTH, DEFAULT_FPS, media_action, publish_args
+from support_protocol.media import FRAME_HEIGHT, FRAME_WIDTH, DEFAULT_FPS, media_action, publish_args, session_ended
 from support_protocol.policy import validate_input
 from support_protocol.tunnel import LocalRTSPBridge
 
@@ -300,7 +302,7 @@ class ClientWindow(QWidget, Background):
         self.chat.setPlainText("\n".join(lines))
         sync_rows(self.steps, [(str(step.get("id", "")), f"{step.get('status')} {step.get('id')} {step.get('body')}")
                                for step in session.get("steps") or []])
-        if status == "resolved":
+        if session_ended(status):
             self._cancel_inputs()
             self.stop_media()
             self.ticket_id = ""
@@ -424,8 +426,44 @@ class ClientWindow(QWidget, Background):
                                 lambda _: self.observation.clear() if self.ticket_id == ticket_id and self.observation.text() == draft else None)
     def resolve(self, accept: bool) -> None:
         ticket_id = self.ticket_id
-        if ticket_id:
-            self.run_background(lambda: self.api.resolve(ticket_id, "client", accept))
+        if not ticket_id:
+            return
+        if accept:
+            self.run_background(lambda: self.api.resolve(ticket_id, "client", True))
+            return
+        review = self._ask_unresolved()
+        if review:
+            self.run_background(lambda: self.api.resolve(ticket_id, "client", False, review, close=True))
+
+    def _ask_unresolved(self) -> str:
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Не решено")
+        what = QPlainTextEdit()
+        what.setPlaceholderText("Что не получилось")
+        why = QPlainTextEdit()
+        why.setPlaceholderText("Почему")
+        hint = QLabel("")
+        hint.setWordWrap(True)
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+
+        def accept_review() -> None:
+            if not what.toPlainText().strip() or not why.toPlainText().strip():
+                hint.setText("Нужно описать, что и почему не получилось")
+                return
+            dialog.accept()
+
+        buttons.accepted.connect(accept_review)
+        buttons.rejected.connect(dialog.reject)
+        layout = QVBoxLayout(dialog)
+        layout.addWidget(label("Что не получилось", "cardTitle"))
+        layout.addWidget(what)
+        layout.addWidget(label("Почему", "cardTitle"))
+        layout.addWidget(why)
+        layout.addWidget(hint)
+        layout.addWidget(buttons)
+        if dialog.exec_() != QDialog.Accepted:
+            return ""
+        return f"Что не получилось: {what.toPlainText().strip()}\nПочему: {why.toPlainText().strip()}"
     def _guarded(self, call) -> None:
         if self.ticket_id:
             self.run_background(call)

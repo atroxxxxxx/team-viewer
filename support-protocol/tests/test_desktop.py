@@ -342,6 +342,52 @@ def test_step_selection_and_scroll_survive_session_updates(app, windows, role):
     assert w.steps.verticalScrollBar().value() == scroll
 
 
+def test_operator_notice_is_not_replaced_by_guided_status(app, windows):
+    _, o = windows
+    o.ticket_id = "ticket"
+    o._note("Нет разрешения на это действие.")
+    o.session = {"ticket": {"status": "guided"}, "steps": [{"id": "step-1", "status": "todo", "body": "Открыть меню", "observations": [{"body": "Меню открыто"}]}]}
+    o._show_session()
+    assert o.status.text() == "Нет разрешения на это действие."
+    assert o.steps.item(0).text() == "todo step-1 Открыть меню · Меню открыто"
+    o._status_until = time.monotonic() - 1
+    o._show_session()
+    assert o.status.text() == "guided · ticket"
+
+
+def test_closed_ticket_ends_operator_session(app, windows):
+    _, o = windows
+    o.reload_queue = lambda: None
+    o.ticket_id = "ticket"
+    o._note("ошибка")
+    o.session = {"ticket": {"status": "closed"}}
+    o._show_session()
+    assert o.ticket_id == ""
+    assert o.status.text() == "Заявка завершена"
+
+
+def test_unresolved_button_sends_review(app, windows, monkeypatch):
+    c, _ = windows
+    c.ticket_id = "ticket"
+    sent = []
+    c.api.resolve = lambda *args, **kwargs: sent.append((args, kwargs)) or {}
+    monkeypatch.setattr(c, "_ask_unresolved", lambda: "Что не получилось: экран\nПочему: нет кнопки")
+    c.resolve(False)
+    pump(app, lambda: bool(sent))
+    assert sent == [(("ticket", "client", False, "Что не получилось: экран\nПочему: нет кнопки"), {"close": True})]
+
+
+def test_unresolved_cancel_does_not_call_api(app, windows, monkeypatch):
+    c, _ = windows
+    c.ticket_id = "ticket"
+    sent = []
+    c.api.resolve = lambda *args, **kwargs: sent.append(args)
+    monkeypatch.setattr(c, "_ask_unresolved", lambda: "")
+    c.resolve(False)
+    app.processEvents()
+    assert sent == []
+
+
 def test_changed_queue_does_not_jump_to_selection(app, windows):
     _, o = windows
     o.show(); app.processEvents()

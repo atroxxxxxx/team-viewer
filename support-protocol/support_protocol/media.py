@@ -68,9 +68,13 @@ def latest_frame(buffer: bytearray, chunk: bytes, frame_size: int) -> bytes | No
     return raw
 
 
+def session_ended(status: str) -> bool:
+    return status in {"resolved", "closed"}
+
+
 def media_action(active_tunnel: str, wanted_tunnel: str, status: str) -> str:
     """Что сделать с публикацией клиента: stop, start, keep или idle."""
-    if status == "resolved":
+    if session_ended(status):
         return "stop" if active_tunnel else "idle"
     if wanted_tunnel and wanted_tunnel != active_tunnel:
         return "start"
@@ -83,7 +87,7 @@ def media_action(active_tunnel: str, wanted_tunnel: str, status: str) -> str:
 
 def should_open_player(playing_tunnel: str, wanted_tunnel: str, running: bool, status: str) -> bool:
     """Оператор открывает плеер, пока заявка жива, а поток ещё не идёт."""
-    if status == "resolved" or not wanted_tunnel:
+    if session_ended(status) or not wanted_tunnel:
         return False
     if playing_tunnel != wanted_tunnel:
         return True

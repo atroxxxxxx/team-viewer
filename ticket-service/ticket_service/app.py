@@ -284,12 +284,17 @@ def build_app(factory: sessionmaker, creds: Checker, relay: Relay, shard_count: 
             try:
                 ticket = store.get_ticket(session, shard, found_id)
                 control, pending = pick_controls(store.grants_for(session, shard, found_id), now)
+                notes: dict[str, list[dict]] = {}
+                for note in store.observations(session, shard, found_id):
+                    notes.setdefault(str(note.step_id), []).append(
+                        {"id": str(note.id), "body": note.body, "created_at": _time(note.created_at)}
+                    )
             except Exception as exc:
                 return fail(exc)
             payload = {
                 "ticket": _ticket(ticket),
                 "messages": [_message(item) for item in store.messages(session, shard, found_id)],
-                "steps": [_step(item) for item in store.steps(session, shard, found_id)],
+                "steps": [_step(item, notes.get(str(item.id), [])) for item in store.steps(session, shard, found_id)],
                 "inputs": [_log(item) for item in store.pending_inputs(session, shard, found_id)],
                 "confirmations": [_confirmation(item) for item in store.confirmations(session, shard, found_id)],
                 "control": _grant(control),
@@ -604,7 +609,15 @@ def build_app(factory: sessionmaker, creds: Checker, relay: Relay, shard_count: 
             return who
         body = await json_body(request, ResolutionRequest)
         accept = body["accept"]
+        close = bool(body.get("close"))
         comment = str(body.get("comment") or "").strip()
+        if close:
+            if who.role != "client":
+                return JSONResponse({"error": "это действие клиента"}, status_code=403)
+            if accept:
+                return JSONResponse({"error": "отзыв закрывает заявку без согласия"}, status_code=400)
+            if not comment or len(comment) > 4000 or not text_allowed(comment):
+                return JSONResponse({"error": "отзыв пустой, слишком длинный или запрещён правилами"}, status_code=400)
         parsed = _uuid(ticket_id, "id заявки должен быть uuid")
         if isinstance(parsed, JSONResponse):
             return parsed
@@ -626,12 +639,15 @@ def build_app(factory: sessionmaker, creds: Checker, relay: Relay, shard_count: 
                 found_id = parsed
             try:
                 with unit(session):
-                    if comment:
-                        store.add_message(session, shard, found_id, who.role, comment)
-                    status = store.confirm(session, shard, found_id, who.role, accept, now)
+                    if close:
+                        status = store.close_unresolved(session, shard, found_id, who.role, comment, now)
+                    else:
+                        if comment:
+                            store.add_message(session, shard, found_id, who.role, comment)
+                        status = store.confirm(session, shard, found_id, who.role, accept, now)
             except Exception as exc:
                 return fail(exc)
-        if status == "resolved":
+        if status in ("resolved", "closed"):
             try:
                 relay.close(found_id)
             except Exception as exc:
@@ -703,8 +719,14 @@ def _message(item) -> dict:
     return {"id": str(item.id), "author": item.author, "body": item.body, "created_at": _time(item.created_at)}
 
 
-def _step(item) -> dict:
-    return {"id": str(item.id), "plan_id": str(item.plan_id), "body": item.body, "status": item.status}
+def _step(item, notes: list[dict] | None = None) -> dict:
+    return {
+        "id": str(item.id),
+        "plan_id": str(item.plan_id),
+        "body": item.body,
+        "status": item.status,
+        "observations": notes or [],
+    }
 
 
 def _log(item) -> dict:

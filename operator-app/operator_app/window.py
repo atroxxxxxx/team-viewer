@@ -24,7 +24,7 @@ from support_protocol.ui import Background, STYLE, connection_settings, card, he
 from support_protocol.settings import UserSettings
 from support_protocol.api import TicketAPI
 from support_protocol.endpoints import config_file, load_endpoints
-from support_protocol.media import FRAME_HEIGHT, FRAME_WIDTH, play_args, should_open_player, latest_frame
+from support_protocol.media import FRAME_HEIGHT, FRAME_WIDTH, latest_frame, play_args, session_ended, should_open_player
 from support_protocol.policy import intent_allowed, validate_input, validate_step
 from support_protocol.tunnel import LocalRTSPBridge
 
@@ -78,6 +78,7 @@ class OperatorWindow(QWidget, Background):
         self.queue_timer.start()
         self._queue_polling = False
         self._queue_snapshot = None
+        self._status_until = 0.0
         self.reload_queue()
 
     def _build(self) -> None:
@@ -232,7 +233,7 @@ class OperatorWindow(QWidget, Background):
             if snapshot != self._queue_snapshot:
                 sync_rows(self.queue, [(ticket_id, f"{ticket_id} {description[:80]}") for ticket_id, description in snapshot])
                 self._queue_snapshot = snapshot
-            if not self.ticket_id:
+            if not self.ticket_id and time.monotonic() >= self._status_until:
                 self.status.setText(f"Заявок в очереди: {len(tickets)}" if tickets else "Очередь пуста")
         def failed(error):
             self._queue_polling = False
@@ -244,24 +245,24 @@ class OperatorWindow(QWidget, Background):
             return
         item = self.queue.currentItem()
         if item is None:
-            self.status.setText("Выберите заявку")
+            self._note("Выберите заявку")
             return
         if self.ticket_id:
-            self.status.setText("Сначала завершите текущую заявку")
+            self._note("Сначала завершите текущую заявку")
             return
         ticket_id = item.text().split()[0]
         self._claiming = True
         def done(claimed):
             self._claiming = False
             self.ticket_id = ticket_id
-            self.status.setText(f"Заявка {ticket_id} захвачена")
+            self._note(f"Заявка {ticket_id} захвачена")
             self._sync_player(claimed["account_id"], claimed["tunnel_id"], "assigned")
         def failed(error):
             self._claiming = False
             self.report_error(error)
         self.run_background(lambda: self.api.claim(ticket_id), done, failed)
     def _sync_player(self, account_id: str, tunnel_id: str, status: str) -> None:
-        if status == "resolved" or not tunnel_id:
+        if session_ended(status) or not tunnel_id:
             self._stop_play()
             return
         running = self.player is not None and self.player.state() != QProcess.NotRunning
@@ -296,7 +297,7 @@ class OperatorWindow(QWidget, Background):
             args = play_args(url)
         except RuntimeError as exc:
             self._stop_play()
-            self.status.setText(str(exc))
+            self._note(str(exc))
             return
         self.buffer.clear()
         self._player_stderr = ""
@@ -392,20 +393,22 @@ class OperatorWindow(QWidget, Background):
     def _show_session(self) -> None:
         ticket = self.session.get("ticket") or {}
         self._sync_player(ticket.get("account_id") or "", ticket.get("tunnel_id") or "", ticket.get("status") or "")
-        self.status.setText(f"{ticket.get('status', '')} · {self.ticket_id}")
-        if ticket.get("status") == "resolved":
+        ended = session_ended(ticket.get("status") or "")
+        if ended or time.monotonic() >= self._status_until:
+            self.status.setText(f"{ticket.get('status', '')} · {self.ticket_id}")
+        if ended:
             self.ticket_id = ""
             self.session = {}
             self.frame = None
             self.preview.clear()
             self.preview.setText("Сеанс завершён")
+            self._status_until = 0.0
             self.status.setText("Заявка завершена")
             self.reload_queue()
             return
         lines = [f"{item.get('author')}: {item.get('body')}" for item in self.session.get("messages") or []]
         self.chat.setPlainText("\n".join(lines))
-        sync_rows(self.steps, [(str(step.get("id", "")), f"{step.get('status')} {step.get('id')} {step.get('body')}")
-                               for step in self.session.get("steps") or []])
+        sync_rows(self.steps, [(str(step.get("id", "")), _step_line(step)) for step in self.session.get("steps") or []])
     def preview_click(self, event) -> None:
         if not self.ticket_id:
             return
@@ -437,7 +440,7 @@ class OperatorWindow(QWidget, Background):
         self.run_background(lambda: self.api.post_input(ticket_id, event))
 
     def _blocked(self, intent: str, detail: str) -> None:
-        self.status.setText(detail)
+        self._note(detail)
         ticket_id = self.ticket_id
         if ticket_id:
             self.run_background(lambda: self.api.log_blocked(ticket_id, intent or "unknown", detail), failed=self.report_error)
@@ -472,7 +475,7 @@ class OperatorWindow(QWidget, Background):
         step_id = _selected_id(self.steps)
         steps = [line.strip() for line in self.plan_text.toPlainText().splitlines() if line.strip()]
         if not step_id or not steps:
-            self.status.setText("Нужны выбранный шаг и строки нового плана")
+            self._note("Нужны выбранный шаг и строки нового плана")
             return
         description = self.problem.text().strip()
         self._guarded(lambda ticket_id: self.api.add_problem(ticket_id, step_id, description, steps))
@@ -506,14 +509,14 @@ class OperatorWindow(QWidget, Background):
         models = self.models
         ticket_id = self.ticket_id
         self.model_button.setEnabled(False)
-        self.status.setText("Модель обрабатывает заявку...")
+        self._note("Модель обрабатывает заявку...")
         def done(action):
             self.model_button.setEnabled(True)
             if self.ticket_id == ticket_id:
                 self._apply_model(action)
         def failed(error):
             self.model_button.setEnabled(True)
-            self.status.setText(f"Модель недоступна: {error}")
+            self._note(f"Модель недоступна: {error}")
         ModelProcess(self, "action", {"models": models, "context": context,
                                       "frame": base64.b64encode(png).decode("ascii") if png else None}, done, failed)
 
@@ -550,13 +553,13 @@ class OperatorWindow(QWidget, Background):
             self.resolve(True)
         elif kind == "input":
             if not self.allow_model_input.isChecked():
-                self.status.setText("Модель предложила ввод. Переключатель выключен, событие не отправлено.")
+                self._note("Модель предложила ввод. Переключатель выключен, событие не отправлено.")
                 return
             event = action.get("input") or {}
             event["intent"] = intent
             self._send_input(event)
         else:
-            self.status.setText("Модель ждёт")
+            self._note("Модель ждёт")
 
     def _png(self) -> bytes | None:
         if self.frame is None:
@@ -573,6 +576,20 @@ class OperatorWindow(QWidget, Background):
                 if self.ticket_id == ticket_id:
                     return call(ticket_id)
             self.run_background(execute, done)
+    def _note(self, text: str) -> None:
+        self._status_until = time.monotonic() + 5
+        self.status.setText(text)
+
+    def report_error(self, error) -> None:
+        super().report_error(error)
+        self._status_until = time.monotonic() + 5
+
+    def service_recovered(self) -> None:
+        failed = self._service_failed
+        super().service_recovered()
+        if failed:
+            self._status_until = time.monotonic() + 5
+
     def closeEvent(self, event) -> None:
         self.close_background()
         for job in list(self._model_jobs):
@@ -592,6 +609,15 @@ def _load_id(path: Path) -> str:
     value = str(uuid.uuid4())
     path.write_text(value, encoding="utf-8")
     return value
+
+
+def _step_line(step: dict) -> str:
+    notes = [str(item.get("body") or "").strip() for item in step.get("observations") or []]
+    line = f"{step.get('status')} {step.get('id')} {step.get('body')}"
+    notes = [note for note in notes if note]
+    if notes:
+        line += " · " + " · ".join(notes)
+    return line
 
 
 def _selected_id(widget: QListWidget) -> str:
