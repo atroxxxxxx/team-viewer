@@ -73,7 +73,7 @@ def lock_ticket(session: Session, shard_id: int, ticket_id: uuid.UUID) -> Ticket
     )
     if ticket is None:
         raise NotFound()
-    if ticket.status == "resolved":
+    if ticket.status in ("resolved", "closed"):
         raise Conflict()
     return ticket
 
@@ -213,6 +213,16 @@ def steps(session: Session, shard_id: int, ticket_id: uuid.UUID) -> list[PlanSte
     )
 
 
+def observations(session: Session, shard_id: int, ticket_id: uuid.UUID) -> list[Observation]:
+    return list(
+        session.scalars(
+            select(Observation)
+            .where(Observation.shard_id == shard_id, Observation.ticket_id == ticket_id)
+            .order_by(Observation.created_at, Observation.id)
+        )
+    )
+
+
 def add_observation(session: Session, shard_id: int, ticket_id: uuid.UUID, step_id: uuid.UUID, body: str) -> None:
     lock_ticket(session, shard_id, ticket_id)
     step = session.get(PlanStep, (shard_id, step_id))
@@ -287,37 +297,62 @@ def confirm(session: Session, shard_id: int, ticket_id: uuid.UUID, role: str, ac
         raise Conflict()
     operator_yes = _latest_accept(session, shard_id, ticket_id, "operator")
     client_yes = _latest_accept(session, shard_id, ticket_id, "client")
-    status = "resolved" if operator_yes and client_yes else "awaiting_client"
-    if status == "resolved":
-        session.execute(
-            update(ControlGrant)
-            .where(
-                ControlGrant.shard_id == shard_id,
-                ControlGrant.ticket_id == ticket_id,
-                ControlGrant.status.in_(("active", "pending")),
-            )
-            .values(status="revoked", scope="", expires_at=now)
+    if operator_yes and client_yes:
+        return _end_ticket(session, shard_id, ticket, now, "resolved")
+    ticket.status = "awaiting_client"
+    return ticket.status
+
+
+def close_unresolved(session: Session, shard_id: int, ticket_id: uuid.UUID, role: str, review: str, now: datetime) -> str:
+    """Клиент закрывает заявку отзывом, не дожидаясь согласия оператора и незакрытых шагов."""
+    ticket = lock_ticket(session, shard_id, ticket_id)
+    session.add(Confirmation(shard_id=shard_id, id=uuid.uuid4(), ticket_id=ticket_id, role=role, accept=False))
+    session.add(ChatMessage(shard_id=shard_id, id=uuid.uuid4(), ticket_id=ticket_id, author=role, body=review))
+    session.add(
+        ActionLog(
+            shard_id=shard_id,
+            id=uuid.uuid4(),
+            ticket_id=ticket_id,
+            actor=role,
+            intent="unresolved_review",
+            phase="applied",
+            detail={"body": review},
         )
-        session.execute(
-            update(ActionLog)
-            .where(
-                ActionLog.shard_id == shard_id,
-                ActionLog.ticket_id == ticket_id,
-                ActionLog.phase == "proposed",
-                ActionLog.detail["type"].astext.in_(("pointer", "key", "text")),
-            )
-            .values(phase="cancelled")
+    )
+    session.flush()
+    return _end_ticket(session, shard_id, ticket, now, "closed")
+
+
+def _end_ticket(session: Session, shard_id: int, ticket: Ticket, now: datetime, status: str) -> str:
+    session.execute(
+        update(ControlGrant)
+        .where(
+            ControlGrant.shard_id == shard_id,
+            ControlGrant.ticket_id == ticket.id,
+            ControlGrant.status.in_(("active", "pending")),
         )
-        session.execute(
-            update(ChatMember)
-            .where(
-                ChatMember.shard_id == shard_id,
-                ChatMember.ticket_id == ticket_id,
-                ChatMember.role == "operator",
-                ChatMember.left_at.is_(None),
-            )
-            .values(left_at=func.now())
+        .values(status="revoked", scope="", expires_at=now)
+    )
+    session.execute(
+        update(ActionLog)
+        .where(
+            ActionLog.shard_id == shard_id,
+            ActionLog.ticket_id == ticket.id,
+            ActionLog.phase == "proposed",
+            ActionLog.detail["type"].astext.in_(("pointer", "key", "text")),
         )
+        .values(phase="cancelled")
+    )
+    session.execute(
+        update(ChatMember)
+        .where(
+            ChatMember.shard_id == shard_id,
+            ChatMember.ticket_id == ticket.id,
+            ChatMember.role == "operator",
+            ChatMember.left_at.is_(None),
+        )
+        .values(left_at=func.now())
+    )
     ticket.status = status
     return status
 

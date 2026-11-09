@@ -85,12 +85,11 @@ class TicketAPI:
             {"parent_step_id": parent_step_id, "description": description, "steps": steps},
         )
 
-    def resolve(self, ticket_id: str, role: str, accept: bool, comment: str = "") -> dict:
-        return self._json(
-            "POST",
-            f"/api/v1/tickets/{ticket_id}/resolution",
-            {"role": role, "accept": accept, "comment": comment},
-        )
+    def resolve(self, ticket_id: str, role: str, accept: bool, comment: str = "", close: bool = False) -> dict:
+        body = {"role": role, "accept": accept, "comment": comment}
+        if close:
+            body["close"] = True
+        return self._json("POST", f"/api/v1/tickets/{ticket_id}/resolution", body)
 
     def health(self):
         return self._json("GET", "/health")

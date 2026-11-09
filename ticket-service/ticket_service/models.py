@@ -83,6 +83,7 @@ class Observation(Base):
     step_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True))
     ticket_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True))
     body: Mapped[str] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
 
 
 class ControlGrant(Base):

@@ -223,8 +223,35 @@ def test_input_result_and_observation_work_before_resolution(api):
     assert api.operator("/plans", {"steps": ["Проверить меню"]}).status_code == 201
     step = api.session()["steps"][0]["id"]
     assert api.client(f"/steps/{step}/observations", {"body": "Меню открыто"}).status_code == 201
+    notes = api.session()["steps"][0]["observations"]
+    assert [item["body"] for item in notes] == ["Меню открыто"]
     assert api.operator(f"/steps/{step}/complete", {}).status_code == 200
     assert api.session()["steps"][0]["status"] == "done"
+
+
+def test_client_review_closes_ticket_without_operator(api):
+    api.claim()
+    assert api.operator("/plans", {"steps": ["Открыть меню"]}).status_code == 201
+    review = "Что не получилось: меню не открылось\nПочему: пункта нет"
+    response = api.client("/resolution", {"accept": False, "close": True, "comment": review})
+    assert response.status_code == 200
+    assert response.json()["status"] == "closed"
+    session = api.session()
+    assert session["ticket"]["status"] == "closed"
+    assert session["messages"][0]["author"] == "client"
+    assert session["messages"][0]["body"] == review
+    assert session["confirmations"][0]["accept"] is False
+    assert api.relay.closes == [uuid.UUID(api.id)]
+    assert api.client("/messages", {"body": "ещё"}).status_code == 409
+
+
+def test_unresolved_review_is_required_and_client_only(api):
+    api.claim()
+    assert api.client("/resolution", {"accept": False, "close": True}).status_code == 400
+    assert api.session()["ticket"]["status"] == "assigned"
+    assert api.operator("/resolution", {"accept": False, "close": True, "comment": "отзыв"}).status_code == 403
+    assert api.client("/resolution", {"accept": False}).json()["status"] == "guided"
+    assert api.relay.closes == []
 
 
 def test_expired_grant_rejects_new_input(api, factory):
