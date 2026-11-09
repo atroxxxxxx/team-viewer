@@ -1,5 +1,12 @@
 """Общие оформление и фоновые задачи настольных приложений."""
-from PyQt5.QtCore import QObject, QRunnable, QThreadPool, pyqtSignal
+import logging
+import threading
+
+from PyQt5.QtCore import QObject, QRunnable, QThreadPool, QTimer, QEvent, QByteArray, pyqtSignal, pyqtSlot
+from support_protocol.media import DEFAULT_FPS, valid_fps
+from support_protocol.errors import TicketError, ServiceUnavailable, user_message
+
+log = logging.getLogger(__name__)
 
 STYLE = """
 QWidget { background: #0b101a; color: #e8edf5; font-family: "Segoe UI", "Arial"; font-size: 13px; }
@@ -92,10 +99,21 @@ class IconBadge(QWidget):
 class StatusLabel(QLabel):
     def setText(self, text):
         super().setText(text)
+        self._fit_text()
         state = "active" if any(word in text.lower() for word in ("assigned", "захвачена", "завершена")) else "neutral"
         self.set_state(state)
 
+    def _fit_text(self):
+        if self.wordWrap():
+            self.setMinimumHeight(max(0, self.heightForWidth(self.width())))
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._fit_text()
+
     def set_state(self, state):
+        if self.property("state") == state:
+            return
         self.setProperty("state", state)
         self.style().unpolish(self)
         self.style().polish(self)
@@ -103,9 +121,15 @@ class StatusLabel(QLabel):
 
 
 class DesktopPreview(QLabel):
+    framePainted = pyqtSignal()
+
     def paintEvent(self, event):
         if self.pixmap() is not None:
             super().paintEvent(event)
+            frame_id = getattr(self, "frame_id", None)
+            if frame_id is not None and frame_id != getattr(self, "_painted_frame", None):
+                self._painted_frame = frame_id
+                self.framePainted.emit()
             return
         painter = QPainter(self)
         painter.setRenderHint(QPainter.Antialiasing)
@@ -156,6 +180,44 @@ def header(title, on_settings):
     return row
 
 
+def sync_rows(widget, rows):
+    """Обновление QListWidget по ID без сброса выбора и положения списка."""
+    from PyQt5.QtWidgets import QListWidgetItem
+    snapshot = tuple(rows)
+    if getattr(widget, "_row_snapshot", None) == snapshot:
+        return
+    current = widget.currentItem()
+    selected = current.data(Qt.UserRole) if current is not None else None
+    scroll = widget.verticalScrollBar().value()
+    existing = {widget.item(i).data(Qt.UserRole): widget.item(i) for i in range(widget.count())}
+    widget.setUpdatesEnabled(False)
+    try:
+        for index, (key, text) in enumerate(rows):
+            item = existing.get(key)
+            if item is None:
+                item = QListWidgetItem(text)
+                item.setData(Qt.UserRole, key)
+                widget.insertItem(index, item)
+            else:
+                if widget.row(item) != index:
+                    widget.takeItem(widget.row(item))
+                    widget.insertItem(index, item)
+                if item.text() != text:
+                    item.setText(text)
+        while widget.count() > len(rows):
+            widget.takeItem(widget.count() - 1)
+        match = next((widget.item(i) for i in range(widget.count()) if widget.item(i).data(Qt.UserRole) == selected), None)
+        if match is not None and widget.currentItem() is not match:
+            widget.setCurrentItem(match)
+        elif match is None:
+            widget.setCurrentRow(-1)
+        widget.doItemsLayout()
+        widget.verticalScrollBar().setValue(scroll)
+        widget._row_snapshot = snapshot
+    finally:
+        widget.setUpdatesEnabled(True)
+
+
 class _Signals(QObject):
     done = pyqtSignal(object, object)
 
@@ -163,47 +225,152 @@ class _Signals(QObject):
 class _Task(QRunnable):
     def __init__(self, call):
         super().__init__()
+        self.setAutoDelete(False)
         self.call = call
+        self.cancelled = threading.Event()
         self.signals = _Signals()
 
     def run(self):
+        if self.cancelled.is_set():
+            return
         try:
             result, error = self.call(), None
         except Exception as exc:
             result, error = None, exc
-        try:
+            if not isinstance(exc, TicketError):
+                log.exception("Desktop background task failed")
+        finally:
+            self.call = None
+        if not self.cancelled.is_set():
             self.signals.done.emit(result, error)
-        except RuntimeError:
-            pass  # Qt может уже завершиться, пока сетевой запрос выполняется.
+
+
+class _Completion(QObject):
+    def __init__(self, parent, callback):
+        super().__init__(parent)
+        self.callback = callback
+
+    @pyqtSlot(object, object)
+    def complete(self, result, error):
+        try:
+            if self.callback:
+                self.callback(result, error)
+        except Exception as exc:
+            log.exception("Desktop result handler failed")
+            self.parent().report_error(exc)
+        finally:
+            self.callback = None
+            self.deleteLater()
+
+
+class _GeometrySaver(QObject):
+    def __init__(self, window):
+        super().__init__(window)
+        self.window = window
+        self.timer = QTimer(self)
+        self.timer.setSingleShot(True)
+        self.timer.setInterval(200)
+        self.timer.timeout.connect(self.save)
+
+    def save(self):
+        self.window.save_preferences(geometry=bytes(self.window.saveGeometry().toBase64()).decode("ascii"))
+
+    def eventFilter(self, watched, event):
+        if event.type() in (QEvent.Resize, QEvent.Move):
+            self.timer.start()
+        return False
 
 
 class Background:
     def run_background(self, call, done=None, failed=None):
+        if self._closing:
+            return
         task = _Task(call)
         def completed(result, error):
-            self._tasks.discard(task)
+            self._tasks.pop(task, None)
             if self._closing:
                 return
             if error is not None:
                 if failed:
                     failed(error)
                 else:
-                    self.status.setText(str(error))
-                    self.status.set_state("error")
+                    self.report_error(error)
             elif done:
                 done(result)
-        task.signals.done.connect(completed)
-        self._tasks.add(task)
+        receiver = _Completion(self, completed)
+        task.signals.done.connect(receiver.complete, Qt.QueuedConnection)
+        self._tasks[task] = receiver
         QThreadPool.globalInstance().start(task)
 
     def init_background(self):
-        self._tasks = set()
+        self._tasks = {}
         self._closing = False
+        self._service_failed = False
+        self._editing_settings = False
+
+    def report_error(self, error):
+        if isinstance(error, ServiceUnavailable):
+            self._service_failed = True
+        message = user_message(error)
+        if self.status.text() != message:
+            self.status.setText(message)
+        self.status.set_state("error")
+
+    def service_recovered(self):
+        if self._service_failed:
+            self._service_failed = False
+            self.status.setText("Связь с сервисом восстановлена")
+
+    def close_background(self):
+        self._closing = True
+        for task, receiver in list(self._tasks.items()):
+            task.cancelled.set()
+            QThreadPool.globalInstance().tryTake(task)
+            receiver.callback = None
+            receiver.deleteLater()
+        self._tasks.clear()
+        if hasattr(self, "_geometry_saver"):
+            self._geometry_saver.timer.stop()
+            self._geometry_saver.save()
+
+    def save_preferences(self, **values):
+        try:
+            self.settings.update(**values)
+            return True
+        except (OSError, ValueError):
+            log.exception("Cannot save desktop settings")
+            self.status.setText("Не удалось сохранить настройки. Проверьте доступ к файлу настроек.")
+            self.status.set_state("error")
+            return False
+
+    def restore_preferences(self, tabs, splitter=None):
+        for name in ("camera", "dangerous", "allow_model_input"):
+            if hasattr(self, name):
+                box = getattr(self, name)
+                box.setChecked(self.settings.get(name, False))
+                box.toggled.connect(lambda value, key=name: self.save_preferences(**{key: value}))
+        tabs.setCurrentIndex(min(self.settings.get("tab", 0), tabs.count() - 1))
+        tabs.currentChanged.connect(lambda value: self.save_preferences(tab=value))
+        if splitter is not None:
+            splitter.restoreState(QByteArray.fromBase64(self.settings.get("splitter", "").encode()))
+            splitter.splitterMoved.connect(lambda *_: self.save_preferences(
+                splitter=bytes(splitter.saveState().toBase64()).decode("ascii")))
+        self.restoreGeometry(QByteArray.fromBase64(self.settings.get("geometry", "").encode()))
+        self._geometry_saver = _GeometrySaver(self)
+        self.installEventFilter(self._geometry_saver)
 
 
 def connection_settings(parent):
-    """Настройки действуют до закрытия приложения; учётные данные не меняются."""
-    from urllib.parse import urlsplit
+    parent._editing_settings = True
+    try:
+        _connection_settings(parent)
+    finally:
+        parent._editing_settings = False
+
+
+def _connection_settings(parent):
+    """Записываем только пользовательские параметры, без паролей и токенов."""
+    from support_protocol.settings import valid_base, valid_host
     from PyQt5.QtWidgets import QCheckBox, QDialog, QDialogButtonBox, QFormLayout, QLineEdit, QMessageBox, QSpinBox, QVBoxLayout
     dialog = QDialog(parent)
     dialog.setWindowTitle("Настройки подключения")
@@ -220,6 +387,17 @@ def connection_settings(parent):
     form.addRow("Адрес ретранслятора", host)
     form.addRow("Порт ретранслятора", port)
     form.addRow(verify)
+    fps, crf = None, None
+    if hasattr(parent, "camera"):
+        from PyQt5.QtCore import QRegularExpression
+        from PyQt5.QtGui import QRegularExpressionValidator
+        fps, crf = QLineEdit(), QSpinBox()
+        fps.setValidator(QRegularExpressionValidator(QRegularExpression("[1-9][0-9]*"), fps))
+        fps.setText(str(parent.settings.get("video_fps", DEFAULT_FPS)))
+        crf.setRange(18, 35)
+        crf.setValue(parent.settings.get("video_crf", 23))
+        form.addRow("Кадров в секунду", fps)
+        form.addRow("Качество CRF (меньше лучше)", crf)
     layout.addLayout(form)
     buttons = QDialogButtonBox(QDialogButtonBox.Save | QDialogButtonBox.Cancel)
     buttons.accepted.connect(dialog.accept)
@@ -227,19 +405,27 @@ def connection_settings(parent):
     layout.addWidget(buttons)
     if dialog.exec_() != QDialog.Accepted:
         return
-    parsed = urlsplit(address.text().strip())
-    try:
-        valid_port = parsed.port is None or 1 <= parsed.port <= 65535
-    except ValueError:
-        valid_port = False
-    if parsed.scheme not in ("http", "https") or not parsed.hostname or parsed.username or parsed.password or parsed.path not in ("", "/") or parsed.query or parsed.fragment or not host.text().strip() or not valid_port:
+    if not valid_base(address.text().strip()) or not valid_host(host.text().strip()):
         QMessageBox.warning(parent, "Настройки", "Укажите корректный адрес сервиса и ретранслятора.")
         return
-    if parent.ticket_id or parent._tasks:
+    if parent.ticket_id or any(getattr(parent, flag, False) for flag in ("_polling", "_queue_polling", "_creating", "_claiming")):
         QMessageBox.warning(parent, "Настройки", "Настройки можно изменить только без активной заявки и ожидающих запросов.")
         return
-    parent.api.base = address.text().strip().rstrip("/")
-    parent.api.verify = verify.isChecked()
-    parent.relay_host = host.text().strip()
-    parent.relay_port = port.value()
-    parent.status.setText("Настройки применены до закрытия приложения")
+    values = dict(api_base=address.text().strip().rstrip("/"), tls_verify=verify.isChecked(),
+                  relay_host=host.text().strip(), relay_port=port.value())
+    if fps is not None:
+        try:
+            requested_fps = int(fps.text())
+            if not valid_fps(requested_fps):
+                raise ValueError("FPS must be positive")
+        except ValueError:
+            QMessageBox.warning(parent, "Настройки", "Введите целое число кадров в секунду больше нуля.")
+            return
+        values.update(video_fps=requested_fps, video_crf=crf.value())
+    if not parent.save_preferences(**values):
+        return
+    parent.api.base = values["api_base"]
+    parent.api.verify = values["tls_verify"]
+    parent.relay_host = values["relay_host"]
+    parent.relay_port = values["relay_port"]
+    parent.status.setText("Настройки сохранены")

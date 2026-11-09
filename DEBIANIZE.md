@@ -22,7 +22,7 @@ sudo apt install devscripts debhelper dh-python pybuild-plugin-pyproject python3
 
 На машине пользователя пакеты сами потянут:
 
-- `python3-pyside6`, `python3-httpx`, `python3-yaml` — оба окна;
+- `python3-pyqt5`, `python3-httpx`, `python3-yaml` — оба окна;
 - `ffmpeg` — экран;
 - `xdotool` — ввод на клиенте;
 - `python3-huggingface-hub`, `python3-pil` — скачивание и кадр оператора.
@@ -31,7 +31,7 @@ sudo apt install devscripts debhelper dh-python pybuild-plugin-pyproject python3
 
 ```bash
 apt-cache search llama-cpp
-apt-cache search pyside6
+apt-cache search pyqt5
 ```
 
 Если модуля нет, операторский пакет оставляет его в `Recommends`, а окно при шаге модели пишет, что нужен `requirements-models.txt`. Поставить его в то же окружение, которым пользуется пакет:
@@ -41,7 +41,7 @@ sudo apt install python3-pip
 pip3 install --user -r operator-app/requirements-models.txt
 ```
 
-Имена пакетов PySide6 на старом Debian могут быть `python3-pyside6.qtwidgets` и соседние. Если `apt-cache show python3-pyside6` пуст, в `Depends` ниже подставьте имена, которые показал поиск.
+Перед сборкой проверьте наличие `python3-pyqt5` в репозиториях целевого выпуска Debian: `apt-cache show python3-pyqt5`.
 
 ## Исходники
 
@@ -66,13 +66,13 @@ Description: общий протокол техподдержки
 
 Package: support-client
 Architecture: all
-Depends: ${python3:Depends}, ${misc:Depends}, python3-support-protocol, python3-pyside6, python3-httpx, python3-yaml, ffmpeg, xdotool
+Depends: ${python3:Depends}, ${misc:Depends}, python3-support-protocol, python3-pyqt5, python3-httpx, python3-yaml, ffmpeg, xdotool
 Description: клиент удалённой техподдержки
  Окно, в котором клиент создаёт заявку и исходящим подключением отдаёт экран.
 
 Package: support-operator
 Architecture: all
-Depends: ${python3:Depends}, ${misc:Depends}, python3-support-protocol, python3-pyside6, python3-httpx, python3-yaml, python3-huggingface-hub, python3-pil, ffmpeg
+Depends: ${python3:Depends}, ${misc:Depends}, python3-support-protocol, python3-pyqt5, python3-httpx, python3-yaml, python3-huggingface-hub, python3-pil, ffmpeg
 Recommends: python3-llama-cpp
 Description: оператор удалённой техподдержки
  Окно оператора. Человек работает сразу. Связка локальных моделей скачивается при первом запуске.
