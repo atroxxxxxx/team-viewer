@@ -5,7 +5,7 @@ import uvicorn
 
 from ticket_service.app import build_app
 from ticket_service.auth import Checker
-from ticket_service.db import engine_from_url, local_shard_count, session_factory
+from ticket_service.db import engine_from_url, ensure_step_order, local_shard_count, session_factory
 from ticket_service.log import error, info
 from ticket_service.relay import Relay
 
@@ -22,6 +22,7 @@ def main() -> None:
         error("shard count", config=shard_count)
         raise SystemExit(1)
     factory = _wait_db(_env("DATABASE_URL", "postgres://support:support@127.0.0.1:5432/support?sslmode=disable"), shard_count)
+    ensure_step_order(factory)
     app = build_app(
         factory,
         creds,

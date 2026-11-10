@@ -78,7 +78,15 @@ def lock_ticket(session: Session, shard_id: int, ticket_id: uuid.UUID) -> Ticket
     return ticket
 
 
-def claim(session: Session, shard_id: int, ticket_id: uuid.UUID, operator_id: uuid.UUID, tunnel_id: uuid.UUID) -> None:
+OPERATOR_PRESENCE = "operator_presence"
+OPERATOR_HANDOFF = "operator_handoff"
+OPERATOR_WAIT = timedelta(seconds=60)
+CLIENT_SWITCH = "Переключение на другого оператора"
+NORMAL_HANDOFF = "Предыдущий оператор штатно прекратил работу"
+CRASH_HANDOFF = "Предыдущий оператор отключился: пропала связь с панелью"
+
+
+def claim(session: Session, shard_id: int, ticket_id: uuid.UUID, operator_id: uuid.UUID, tunnel_id: uuid.UUID, now: datetime | None = None) -> None:
     result = session.execute(
         update(Ticket)
         .where(Ticket.shard_id == shard_id, Ticket.id == ticket_id, Ticket.status == "queued")
@@ -86,8 +94,156 @@ def claim(session: Session, shard_id: int, ticket_id: uuid.UUID, operator_id: uu
     )
     if result.rowcount == 0:
         raise Conflict()
-    session.add(ChatMember(shard_id=shard_id, ticket_id=ticket_id, member_id=str(operator_id), role="operator"))
+    _join_operator(session, shard_id, ticket_id, operator_id)
     _action(session, shard_id, ticket_id, str(operator_id), "claim", "applied")
+    touch_operator(session, shard_id, ticket_id, operator_id, now or datetime.now(timezone.utc))
+
+
+def touch_operator(session: Session, shard_id: int, ticket_id: uuid.UUID, operator_id: uuid.UUID, now: datetime) -> None:
+    row = session.scalar(
+        select(ActionLog).where(
+            ActionLog.shard_id == shard_id,
+            ActionLog.ticket_id == ticket_id,
+            ActionLog.intent == OPERATOR_PRESENCE,
+        ).limit(1)
+    )
+    if row is None:
+        session.add(ActionLog(
+            shard_id=shard_id, id=uuid.uuid4(), ticket_id=ticket_id, actor=str(operator_id),
+            intent=OPERATOR_PRESENCE, phase="applied", detail={}, created_at=now,
+        ))
+    else:
+        row.actor = str(operator_id)
+        row.created_at = now
+
+
+TUNNEL_ACCESS = "tunnel_access"
+
+
+def save_tunnel_access(session: Session, shard_id: int, ticket_id: uuid.UUID, client_secret: str, operator_secret: str) -> None:
+    session.add(ActionLog(
+        shard_id=shard_id, id=uuid.uuid4(), ticket_id=ticket_id, actor="сервис",
+        intent=TUNNEL_ACCESS, phase="applied",
+        detail={"client_secret": client_secret, "operator_secret": operator_secret},
+    ))
+
+
+def media_secret(session: Session, shard_id: int, ticket_id: uuid.UUID, role: str) -> str:
+    detail = session.scalar(
+        select(ActionLog.detail).where(
+            ActionLog.shard_id == shard_id,
+            ActionLog.ticket_id == ticket_id,
+            ActionLog.intent == TUNNEL_ACCESS,
+        ).order_by(ActionLog.created_at.desc()).limit(1)
+    )
+    if not isinstance(detail, dict):
+        return ""
+    value = str(detail.get("client_secret" if role == "client" else "operator_secret") or "")
+    return value if len(value) == 64 else ""
+
+
+def handoff_note(session: Session, shard_id: int, ticket_id: uuid.UUID) -> dict:
+    detail = session.scalar(
+        select(ActionLog.detail).where(
+            ActionLog.shard_id == shard_id,
+            ActionLog.ticket_id == ticket_id,
+            ActionLog.intent == OPERATOR_HANDOFF,
+        ).order_by(ActionLog.created_at.desc()).limit(1)
+    )
+    return detail if isinstance(detail, dict) else {}
+
+
+def release_operator(session: Session, shard_id: int, ticket_id: uuid.UUID, now: datetime, kind: str) -> bool:
+    try:
+        ticket = lock_ticket(session, shard_id, ticket_id)
+    except Conflict:
+        return False
+    if ticket.status == "queued":
+        return False
+    _clear_operator(session, shard_id, ticket, now)
+    ticket.status = "queued"
+    ticket.assignee = None
+    ticket.tunnel_id = None
+    session.add(ActionLog(
+        shard_id=shard_id, id=uuid.uuid4(), ticket_id=ticket_id, actor="operator",
+        intent=OPERATOR_HANDOFF, phase="applied",
+        detail={
+            "kind": kind,
+            "operator": CRASH_HANDOFF if kind == "crash" else NORMAL_HANDOFF,
+            "client": CLIENT_SWITCH,
+        },
+    ))
+    return True
+
+
+def expire_operators(session: Session, now: datetime) -> list[uuid.UUID]:
+    tickets = list(session.scalars(select(Ticket).where(Ticket.status.notin_(("queued", "resolved", "closed")))))
+    released = []
+    for ticket in tickets:
+        if _operator_silent(session, ticket, now) and release_operator(session, ticket.shard_id, ticket.id, now, "crash"):
+            released.append(ticket.id)
+    return released
+
+
+def _operator_silent(session: Session, ticket: Ticket, now: datetime) -> bool:
+    if ticket.assignee is None:
+        return False
+    seen = session.scalar(
+        select(ActionLog.created_at).where(
+            ActionLog.shard_id == ticket.shard_id,
+            ActionLog.ticket_id == ticket.id,
+            ActionLog.intent == OPERATOR_PRESENCE,
+        ).order_by(ActionLog.created_at.desc()).limit(1)
+    )
+    return seen is not None and now - seen >= OPERATOR_WAIT
+
+
+def _join_operator(session: Session, shard_id: int, ticket_id: uuid.UUID, operator_id: uuid.UUID) -> None:
+    member_id = str(operator_id)
+    member = session.scalar(
+        select(ChatMember).where(
+            ChatMember.shard_id == shard_id,
+            ChatMember.ticket_id == ticket_id,
+            ChatMember.member_id == member_id,
+        )
+    )
+    if member is None:
+        session.add(ChatMember(shard_id=shard_id, ticket_id=ticket_id, member_id=member_id, role="operator"))
+    else:
+        member.left_at = None
+        member.role = "operator"
+
+
+def _clear_operator(session: Session, shard_id: int, ticket: Ticket, now: datetime) -> None:
+    session.execute(
+        update(ControlGrant)
+        .where(
+            ControlGrant.shard_id == shard_id,
+            ControlGrant.ticket_id == ticket.id,
+            ControlGrant.status.in_(("active", "pending")),
+        )
+        .values(status="revoked", scope="", expires_at=now)
+    )
+    session.execute(
+        update(ActionLog)
+        .where(
+            ActionLog.shard_id == shard_id,
+            ActionLog.ticket_id == ticket.id,
+            ActionLog.phase == "proposed",
+            ActionLog.detail["type"].astext.in_(("pointer", "key", "text")),
+        )
+        .values(phase="cancelled")
+    )
+    session.execute(
+        update(ChatMember)
+        .where(
+            ChatMember.shard_id == shard_id,
+            ChatMember.ticket_id == ticket.id,
+            ChatMember.role == "operator",
+            ChatMember.left_at.is_(None),
+        )
+        .values(left_at=func.now())
+    )
 
 
 def add_message(session: Session, shard_id: int, ticket_id: uuid.UUID, author: str, body: str) -> None:
@@ -196,8 +352,13 @@ def create_plan(session: Session, shard_id: int, ticket_id: uuid.UUID, problem_i
     session.add(Plan(shard_id=shard_id, id=plan_id, ticket_id=ticket_id, problem_id=problem_id))
     # Шаг ссылается на план. План должен уже быть в транзакции, иначе внешний ключ не видит его.
     session.flush()
+    position = _next_position(session, shard_id, ticket_id)
     for body in steps:
-        session.add(PlanStep(shard_id=shard_id, id=uuid.uuid4(), plan_id=plan_id, ticket_id=ticket_id, body=body, status="todo"))
+        session.add(PlanStep(
+            shard_id=shard_id, id=uuid.uuid4(), plan_id=plan_id, ticket_id=ticket_id,
+            body=body, status="todo", position=position,
+        ))
+        position += 1
     session.execute(
         update(Ticket)
         .where(Ticket.shard_id == shard_id, Ticket.id == ticket_id, Ticket.status != "remote_control")
@@ -209,7 +370,11 @@ def create_plan(session: Session, shard_id: int, ticket_id: uuid.UUID, problem_i
 
 def steps(session: Session, shard_id: int, ticket_id: uuid.UUID) -> list[PlanStep]:
     return list(
-        session.scalars(select(PlanStep).where(PlanStep.shard_id == shard_id, PlanStep.ticket_id == ticket_id).order_by(PlanStep.body))
+        session.scalars(
+            select(PlanStep)
+            .where(PlanStep.shard_id == shard_id, PlanStep.ticket_id == ticket_id)
+            .order_by(PlanStep.position, PlanStep.status == "cancelled", PlanStep.id)
+        )
     )
 
 
@@ -223,12 +388,17 @@ def observations(session: Session, shard_id: int, ticket_id: uuid.UUID) -> list[
     )
 
 
-def add_observation(session: Session, shard_id: int, ticket_id: uuid.UUID, step_id: uuid.UUID, body: str) -> None:
+def add_observation(session: Session, shard_id: int, ticket_id: uuid.UUID, step_id: uuid.UUID, body: str, announce: bool = False) -> None:
     lock_ticket(session, shard_id, ticket_id)
     step = session.get(PlanStep, (shard_id, step_id))
     if step is None or step.ticket_id != ticket_id:
         raise NotFound()
     session.add(Observation(shard_id=shard_id, id=uuid.uuid4(), step_id=step_id, ticket_id=ticket_id, body=body))
+    if announce:
+        session.add(ChatMessage(
+            shard_id=shard_id, id=uuid.uuid4(), ticket_id=ticket_id, author="client",
+            body=f"По шагу «{step.body}»: {body}",
+        ))
 
 
 def complete_step(session: Session, shard_id: int, ticket_id: uuid.UUID, step_id: uuid.UUID, seen: bool, body: str) -> None:
@@ -259,7 +429,10 @@ def revise_step(session: Session, shard_id: int, ticket_id: uuid.UUID, step_id: 
         raise Conflict()
     plan_id = step.plan_id
     step.status = "cancelled"
-    session.add(PlanStep(shard_id=shard_id, id=uuid.uuid4(), plan_id=plan_id, ticket_id=ticket_id, body=body, status="todo"))
+    session.add(PlanStep(
+        shard_id=shard_id, id=uuid.uuid4(), plan_id=plan_id, ticket_id=ticket_id,
+        body=body, status="todo", position=step.position,
+    ))
 
 
 def add_problem(session: Session, shard_id: int, ticket_id: uuid.UUID, parent_step: uuid.UUID, description: str, plan_steps: list[str]) -> uuid.UUID:
@@ -303,6 +476,14 @@ def confirm(session: Session, shard_id: int, ticket_id: uuid.UUID, role: str, ac
     return ticket.status
 
 
+def close_resolved(session: Session, shard_id: int, ticket_id: uuid.UUID, role: str, now: datetime) -> str:
+    """Клиент считает проблему решённой и закрывает заявку, даже если шаги ещё открыты."""
+    ticket = lock_ticket(session, shard_id, ticket_id)
+    session.add(Confirmation(shard_id=shard_id, id=uuid.uuid4(), ticket_id=ticket_id, role=role, accept=True))
+    session.flush()
+    return _end_ticket(session, shard_id, ticket, now, "resolved")
+
+
 def close_unresolved(session: Session, shard_id: int, ticket_id: uuid.UUID, role: str, review: str, now: datetime) -> str:
     """Клиент закрывает заявку отзывом, не дожидаясь согласия оператора и незакрытых шагов."""
     ticket = lock_ticket(session, shard_id, ticket_id)
@@ -324,35 +505,7 @@ def close_unresolved(session: Session, shard_id: int, ticket_id: uuid.UUID, role
 
 
 def _end_ticket(session: Session, shard_id: int, ticket: Ticket, now: datetime, status: str) -> str:
-    session.execute(
-        update(ControlGrant)
-        .where(
-            ControlGrant.shard_id == shard_id,
-            ControlGrant.ticket_id == ticket.id,
-            ControlGrant.status.in_(("active", "pending")),
-        )
-        .values(status="revoked", scope="", expires_at=now)
-    )
-    session.execute(
-        update(ActionLog)
-        .where(
-            ActionLog.shard_id == shard_id,
-            ActionLog.ticket_id == ticket.id,
-            ActionLog.phase == "proposed",
-            ActionLog.detail["type"].astext.in_(("pointer", "key", "text")),
-        )
-        .values(phase="cancelled")
-    )
-    session.execute(
-        update(ChatMember)
-        .where(
-            ChatMember.shard_id == shard_id,
-            ChatMember.ticket_id == ticket.id,
-            ChatMember.role == "operator",
-            ChatMember.left_at.is_(None),
-        )
-        .values(left_at=func.now())
-    )
+    _clear_operator(session, shard_id, ticket, now)
     ticket.status = status
     return status
 
@@ -382,6 +535,90 @@ def _latest_accept(session: Session, shard_id: int, ticket_id: uuid.UUID, role: 
         .limit(1)
     )
     return bool(value)
+
+
+PRESENCE = "client_presence"
+CLIENT_WAIT = timedelta(seconds=60)
+
+
+def touch_client(session: Session, shard_id: int, ticket_id: uuid.UUID, now: datetime) -> None:
+    ticket = session.get(Ticket, (shard_id, ticket_id))
+    if ticket is None or ticket.status in ("resolved", "closed"):
+        return
+    row = session.scalar(
+        select(ActionLog).where(
+            ActionLog.shard_id == shard_id,
+            ActionLog.ticket_id == ticket_id,
+            ActionLog.intent == PRESENCE,
+        ).limit(1)
+    )
+    if row is None:
+        session.add(ActionLog(
+            shard_id=shard_id, id=uuid.uuid4(), ticket_id=ticket_id, actor="client",
+            intent=PRESENCE, phase="applied", detail={}, created_at=now,
+        ))
+    else:
+        row.created_at = now
+
+
+def expire_ticket(session: Session, shard_id: int, ticket_id: uuid.UUID, now: datetime) -> bool:
+    ticket = session.get(Ticket, (shard_id, ticket_id))
+    if ticket is None or ticket.status in ("resolved", "closed") or not _client_gone(session, shard_id, ticket, now):
+        return False
+    try:
+        ticket = lock_ticket(session, shard_id, ticket_id)
+    except Conflict:
+        return False
+    session.add(ChatMessage(
+        shard_id=shard_id, id=uuid.uuid4(), ticket_id=ticket_id, author="сервис",
+        body="Заявка закрыта: клиент не ответил или отключился",
+    ))
+    session.add(Confirmation(shard_id=shard_id, id=uuid.uuid4(), ticket_id=ticket_id, role="system", accept=False))
+    _end_ticket(session, shard_id, ticket, now, "closed")
+    return True
+
+
+def expire_open(session: Session, now: datetime) -> list[uuid.UUID]:
+    tickets = list(session.scalars(select(Ticket).where(Ticket.status.notin_(("resolved", "closed")))))
+    return [ticket.id for ticket in tickets if expire_ticket(session, ticket.shard_id, ticket.id, now)]
+
+
+def _client_gone(session: Session, shard_id: int, ticket: Ticket, now: datetime) -> bool:
+    if ticket.status == "awaiting_client":
+        started = session.scalar(
+            select(Confirmation.created_at)
+            .where(
+                Confirmation.shard_id == shard_id,
+                Confirmation.ticket_id == ticket.id,
+                Confirmation.accept.is_(True),
+            )
+            .order_by(Confirmation.created_at.desc())
+            .limit(1)
+        )
+        if started is not None and now - started >= CLIENT_WAIT:
+            return True
+    seen = session.scalar(
+        select(ActionLog.created_at)
+        .where(
+            ActionLog.shard_id == shard_id,
+            ActionLog.ticket_id == ticket.id,
+            ActionLog.intent == PRESENCE,
+        )
+        .order_by(ActionLog.created_at.desc())
+        .limit(1)
+    )
+    return seen is not None and now - seen >= CLIENT_WAIT
+
+
+def _next_position(session: Session, shard_id: int, ticket_id: uuid.UUID) -> int:
+    current = session.scalar(
+        select(func.max(PlanStep.position)).where(
+            PlanStep.shard_id == shard_id,
+            PlanStep.ticket_id == ticket_id,
+            PlanStep.position >= 0,
+        )
+    )
+    return 0 if current is None else int(current) + 1
 
 
 def _action(session: Session, shard_id: int, ticket_id: uuid.UUID, actor: str, intent: str, phase: str) -> None:

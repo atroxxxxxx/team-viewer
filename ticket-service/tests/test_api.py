@@ -10,6 +10,7 @@ from fastapi.testclient import TestClient
 from sqlalchemy import func, select, text
 
 from ticket_service.app import build_app
+from ticket_service.relay import OpenedTunnel
 from ticket_service.auth import Checker
 from ticket_service.models import ActionLog, Confirmation, ControlGrant, Observation, Ticket
 
@@ -38,7 +39,7 @@ class RelayStub:
             raise ConnectionError("test relay unavailable")
         tunnel = uuid.uuid4()
         self.tunnels[ticket_id] = tunnel
-        return tunnel
+        return OpenedTunnel(tunnel, "c" * 64, "o" * 64)
 
     def close(self, ticket_id):
         self.closes.append(ticket_id)
@@ -96,6 +97,20 @@ def api(factory):
     app = build_app(factory, Checker(*CLIENT, *OPERATOR), relay, 4, "/openapi/tickets.json")
     with TestClient(app) as http:
         yield API(http, relay)
+
+
+def test_media_secret_is_role_specific_and_queue_hides_account(api):
+    queued = api.http.get("/api/v1/tickets", auth=OPERATOR)
+    assert queued.status_code == 200, queued.text
+    row = queued.json()["tickets"][0]
+    assert "account_id" not in row and "tunnel_id" not in row and "media_secret" not in row
+    claimed = api.claim()
+    assert claimed["media_secret"] == "o" * 64
+    assert api.session()["media_secret"] == "c" * 64
+    operator = api.http.get(api.path + "/session", auth=OPERATOR)
+    assert operator.status_code == 200, operator.text
+    assert operator.json()["media_secret"] == "o" * 64
+    assert "client_secret" not in operator.json()
 
 
 def test_repeat_claim_preserves_existing_tunnel(api):
@@ -225,8 +240,51 @@ def test_input_result_and_observation_work_before_resolution(api):
     assert api.client(f"/steps/{step}/observations", {"body": "Меню открыто"}).status_code == 201
     notes = api.session()["steps"][0]["observations"]
     assert [item["body"] for item in notes] == ["Меню открыто"]
+    assert api.session()["messages"][-1]["body"] == "По шагу «Проверить меню»: Меню открыто"
     assert api.operator(f"/steps/{step}/complete", {}).status_code == 200
     assert api.session()["steps"][0]["status"] == "done"
+
+
+def test_client_accept_closes_even_with_open_steps(api):
+    api.claim()
+    assert api.operator("/plans", {"steps": ["Открыть меню"]}).status_code == 201
+    response = api.client("/resolution", {"accept": True})
+    assert response.status_code == 200
+    assert response.json()["status"] == "resolved"
+    assert api.session()["ticket"]["status"] == "resolved"
+    assert api.relay.closes == [uuid.UUID(api.id)]
+
+
+def test_plan_steps_keep_submission_order(api):
+    api.claim()
+    steps = ["Яблоко", "Арбуз", "Банан"]
+    assert api.operator("/plans", {"steps": steps}).status_code == 201
+    assert [item["body"] for item in api.session()["steps"]] == steps
+
+
+def test_awaiting_client_closes_after_one_minute(api, factory):
+    api.claim()
+    assert api.operator("/resolution", {"accept": True}).json()["status"] == "awaiting_client"
+    stale = datetime.now(timezone.utc) - timedelta(seconds=61)
+    with factory.begin() as session:
+        session.execute(text("UPDATE confirmations SET created_at = :stale"), {"stale": stale})
+    assert api.session()["ticket"]["status"] == "closed"
+    assert api.relay.closes == [uuid.UUID(api.id)]
+
+
+def test_silent_client_closes_ticket(api, factory):
+    api.claim()
+    api.session()
+    stale = datetime.now(timezone.utc) - timedelta(seconds=61)
+    with factory.begin() as session:
+        session.execute(
+            text("UPDATE action_log SET created_at = :stale WHERE intent = 'client_presence'"),
+            {"stale": stale},
+        )
+    response = api.http.get(api.path + "/session", auth=OPERATOR)
+    assert response.status_code == 200, response.text
+    assert response.json()["ticket"]["status"] == "closed"
+    assert api.relay.closes == [uuid.UUID(api.id)]
 
 
 def test_client_review_closes_ticket_without_operator(api):
@@ -317,7 +375,9 @@ def test_resolved_ticket_rejects_further_changes(resolved, operation):
         "reject": lambda: api.client("/resolution", {"accept": False, "comment": "test"}),
         "accept": lambda: api.operator("/resolution", {"accept": True}),
     }
-    assert calls[operation]().status_code == 409
+    # Повторное подтверждение уже закрытой заявки не меняет её и отдаёт текущий статус.
+    expected = 200 if operation in {"reject", "accept"} else 409
+    assert calls[operation]().status_code == expected
     snapshot = api.session()
     assert snapshot["ticket"]["status"] == "resolved"
     assert snapshot["messages"] == []

@@ -16,10 +16,12 @@ const TTL = 15 * time.Minute
 var ErrDenied = errors.New("denied")
 
 type Tunnel struct {
-	TunnelID string `json:"tunnel_id"`
-	ClientID string `json:"client_id"`
-	TicketID string `json:"ticket_id"`
-	Camera   bool   `json:"camera"`
+	TunnelID       string `json:"tunnel_id"`
+	ClientID       string `json:"client_id"`
+	TicketID       string `json:"ticket_id"`
+	Camera         bool   `json:"camera"`
+	ClientSecret   string `json:"client_secret"`
+	OperatorSecret string `json:"operator_secret"`
 }
 
 type Store struct {
