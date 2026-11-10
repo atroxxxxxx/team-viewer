@@ -24,6 +24,7 @@ from support_protocol.ui import Background, STYLE, connection_settings, card, he
 from support_protocol.settings import UserSettings
 from support_protocol.api import TicketAPI
 from support_protocol.endpoints import config_file, load_endpoints
+from support_protocol.labels import step_line, ticket_status
 from support_protocol.media import FRAME_HEIGHT, FRAME_WIDTH, latest_frame, play_args, session_ended, should_open_player
 from support_protocol.policy import intent_allowed, validate_input, validate_step
 from support_protocol.tunnel import LocalRTSPBridge
@@ -52,6 +53,7 @@ class OperatorWindow(QWidget, Background):
         self.playing_tunnel = ""
         self.play_gen = 0
         self.bridge: LocalRTSPBridge | None = None
+        self.media_secret = ""
         self.session: dict = {}
         self.player: QProcess | None = None
         self.buffer = bytearray()
@@ -161,6 +163,7 @@ class OperatorWindow(QWidget, Background):
         plan_layout = QVBoxLayout(plan_page)
         plan_layout.setContentsMargins(0, 16, 0, 0)
         plan_layout.setSpacing(8)
+        plan_layout.addWidget(label("Ответы клиента по шагам видны здесь и в чате", "muted"))
         plan_layout.addWidget(self.steps, 1)
         plan_layout.addWidget(self.plan_text, 1)
         plan_row = QHBoxLayout()
@@ -192,7 +195,7 @@ class OperatorWindow(QWidget, Background):
         desktop_layout.addWidget(label("УДАЛЁННОЕ УСТРОЙСТВО", "eyebrow"))
         video_heading = QHBoxLayout()
         video_heading.addWidget(label("Экран клиента", "cardTitle"), 1)
-        self.video_rate = label("— FPS", "muted")
+        self.video_rate = label("— кадр/с", "muted")
         video_heading.addWidget(self.video_rate)
         desktop_layout.addLayout(video_heading)
         viewport, viewport_layout = card("viewport", 12, 0)
@@ -229,9 +232,15 @@ class OperatorWindow(QWidget, Background):
         def done(tickets):
             self._queue_polling = False
             self.service_recovered()
-            snapshot = [(str(t.get("ticket_id", "")), str(t.get("description", ""))) for t in tickets]
+            snapshot = [
+                (str(t.get("ticket_id", "")), str(t.get("description", "")), str(t.get("handoff") or ""))
+                for t in tickets
+            ]
             if snapshot != self._queue_snapshot:
-                sync_rows(self.queue, [(ticket_id, f"{ticket_id} {description[:80]}") for ticket_id, description in snapshot])
+                sync_rows(self.queue, [
+                    (ticket_id, f"{ticket_id} {description[:80]}" + (f" — {handoff}" if handoff else ""))
+                    for ticket_id, description, handoff in snapshot
+                ])
                 self._queue_snapshot = snapshot
             if not self.ticket_id and time.monotonic() >= self._status_until:
                 self.status.setText(f"Заявок в очереди: {len(tickets)}" if tickets else "Очередь пуста")
@@ -256,6 +265,7 @@ class OperatorWindow(QWidget, Background):
             self._claiming = False
             self.ticket_id = ticket_id
             self._note(f"Заявка {ticket_id} захвачена")
+            self.media_secret = str(claimed.get("media_secret") or "")
             self._sync_player(claimed["account_id"], claimed["tunnel_id"], "assigned")
         def failed(error):
             self._claiming = False
@@ -266,7 +276,7 @@ class OperatorWindow(QWidget, Background):
             self._stop_play()
             return
         running = self.player is not None and self.player.state() != QProcess.NotRunning
-        if account_id and should_open_player(self.playing_tunnel, tunnel_id, running, status):
+        if account_id and len(self.media_secret) == 64 and should_open_player(self.playing_tunnel, tunnel_id, running, status):
             self._play(account_id, tunnel_id)
 
     def _stop_play(self) -> None:
@@ -279,7 +289,7 @@ class OperatorWindow(QWidget, Background):
         self._pending_frame = None
         self.render_timer.stop()
         self._frame_times.clear()
-        self.video_rate.setText("— FPS")
+        self.video_rate.setText("— кадр/с")
         self.frame = None
         self.buffer.clear()
         self.preview.clear()
@@ -291,7 +301,7 @@ class OperatorWindow(QWidget, Background):
         self._stop_play()
         gen = self.play_gen
         self.playing_tunnel = tunnel_id
-        self.bridge = LocalRTSPBridge(self.relay_host, self.relay_port, "OPERATOR", account_id)
+        self.bridge = LocalRTSPBridge(self.relay_host, self.relay_port, "OPERATOR", account_id, self.media_secret)
         url = self.bridge.url(f"/tunnels/{tunnel_id}/screen")
         try:
             args = play_args(url)
@@ -331,7 +341,7 @@ class OperatorWindow(QWidget, Background):
         self._pending_frame = None
         self.render_timer.stop()
         self._frame_times.clear()
-        self.video_rate.setText("— FPS")
+        self.video_rate.setText("— кадр/с")
         self.preview.clear()
         self.preview.setText("Поток прерван. Повторное подключение...")
 
@@ -364,11 +374,11 @@ class OperatorWindow(QWidget, Background):
 
     def _update_video_rate(self):
         if len(self._frame_times) < 2 or time.monotonic() - self._frame_times[-1] > 2:
-            self.video_rate.setText("— FPS")
+            self.video_rate.setText("— кадр/с")
             return
         elapsed = self._frame_times[-1] - self._frame_times[0]
         fps = (len(self._frame_times) - 1) / elapsed if elapsed > 0 else 0
-        self.video_rate.setText(f"{fps:.0f} FPS")
+        self.video_rate.setText(f"{fps:.0f} кадр/с")
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
@@ -392,10 +402,26 @@ class OperatorWindow(QWidget, Background):
 
     def _show_session(self) -> None:
         ticket = self.session.get("ticket") or {}
+        secret = str(self.session.get("media_secret") or "")
+        if secret:
+            self.media_secret = secret
         self._sync_player(ticket.get("account_id") or "", ticket.get("tunnel_id") or "", ticket.get("status") or "")
-        ended = session_ended(ticket.get("status") or "")
+        status = ticket.get("status") or ""
+        if status == "queued" or self.session.get("owned") is False:
+            self._stop_play()
+            self.ticket_id = ""
+            self.media_secret = ""
+            self.session = {}
+            self.frame = None
+            self.preview.clear()
+            self.preview.setText("Экран появится после захвата")
+            self._note("Заявка вернулась в очередь")
+            self.reload_queue()
+            return
+        ended = session_ended(status)
+        notice = str((self.session.get("handoff") or {}).get("operator") or "")
         if ended or time.monotonic() >= self._status_until:
-            self.status.setText(f"{ticket.get('status', '')} · {self.ticket_id}")
+            self.status.setText(notice or ticket_status(status, self.ticket_id))
         if ended:
             self.ticket_id = ""
             self.session = {}
@@ -408,7 +434,7 @@ class OperatorWindow(QWidget, Background):
             return
         lines = [f"{item.get('author')}: {item.get('body')}" for item in self.session.get("messages") or []]
         self.chat.setPlainText("\n".join(lines))
-        sync_rows(self.steps, [(str(step.get("id", "")), _step_line(step)) for step in self.session.get("steps") or []])
+        sync_rows(self.steps, [(str(step.get("id", "")), step_line(step)) for step in self.session.get("steps") or []])
     def preview_click(self, event) -> None:
         if not self.ticket_id:
             return
@@ -591,6 +617,13 @@ class OperatorWindow(QWidget, Background):
             self._status_until = time.monotonic() + 5
 
     def closeEvent(self, event) -> None:
+        ticket_id = self.ticket_id
+        self.ticket_id = ""
+        if ticket_id:
+            try:
+                self.api.release(ticket_id)
+            except Exception:
+                pass
         self.close_background()
         for job in list(self._model_jobs):
             job.kill()
@@ -611,18 +644,8 @@ def _load_id(path: Path) -> str:
     return value
 
 
-def _step_line(step: dict) -> str:
-    notes = [str(item.get("body") or "").strip() for item in step.get("observations") or []]
-    line = f"{step.get('status')} {step.get('id')} {step.get('body')}"
-    notes = [note for note in notes if note]
-    if notes:
-        line += " · " + " · ".join(notes)
-    return line
-
-
 def _selected_id(widget: QListWidget) -> str:
     item = widget.currentItem()
     if item is None:
         return ""
-    parts = item.text().split()
-    return parts[1] if len(parts) > 1 else ""
+    return str(item.data(Qt.UserRole) or "")

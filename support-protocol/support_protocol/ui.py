@@ -3,6 +3,7 @@ import logging
 import threading
 
 from PyQt5.QtCore import QObject, QRunnable, QThreadPool, QTimer, QEvent, QByteArray, pyqtSignal, pyqtSlot
+from PyQt5.QtWidgets import QMessageBox
 from support_protocol.media import DEFAULT_FPS, valid_fps
 from support_protocol.errors import TicketError, ServiceUnavailable, user_message
 
@@ -360,6 +361,27 @@ class Background:
         self.installEventFilter(self._geometry_saver)
 
 
+def ask_yes_no(parent, title: str, text: str) -> bool:
+    box = QMessageBox(parent)
+    box.setIcon(QMessageBox.Question)
+    box.setWindowTitle(title)
+    box.setText(text)
+    box.setStandardButtons(QMessageBox.Yes | QMessageBox.No)
+    box.button(QMessageBox.Yes).setText("Да")
+    box.button(QMessageBox.No).setText("Нет")
+    return box.exec_() == QMessageBox.Yes
+
+
+def warn(parent, title: str, text: str) -> None:
+    box = QMessageBox(parent)
+    box.setIcon(QMessageBox.Warning)
+    box.setWindowTitle(title)
+    box.setText(text)
+    box.setStandardButtons(QMessageBox.Ok)
+    box.button(QMessageBox.Ok).setText("Понятно")
+    box.exec_()
+
+
 def connection_settings(parent):
     parent._editing_settings = True
     try:
@@ -371,7 +393,7 @@ def connection_settings(parent):
 def _connection_settings(parent):
     """Записываем только пользовательские параметры, без паролей и токенов."""
     from support_protocol.settings import valid_base, valid_host
-    from PyQt5.QtWidgets import QCheckBox, QDialog, QDialogButtonBox, QFormLayout, QLineEdit, QMessageBox, QSpinBox, QVBoxLayout
+    from PyQt5.QtWidgets import QCheckBox, QDialog, QDialogButtonBox, QFormLayout, QLineEdit, QSpinBox, QVBoxLayout
     dialog = QDialog(parent)
     dialog.setWindowTitle("Настройки подключения")
     layout = QVBoxLayout(dialog)
@@ -397,19 +419,21 @@ def _connection_settings(parent):
         crf.setRange(18, 35)
         crf.setValue(parent.settings.get("video_crf", 23))
         form.addRow("Кадров в секунду", fps)
-        form.addRow("Качество CRF (меньше лучше)", crf)
+        form.addRow("Качество сжатия, от 18 до 35", crf)
     layout.addLayout(form)
     buttons = QDialogButtonBox(QDialogButtonBox.Save | QDialogButtonBox.Cancel)
+    buttons.button(QDialogButtonBox.Save).setText("Сохранить")
+    buttons.button(QDialogButtonBox.Cancel).setText("Отмена")
     buttons.accepted.connect(dialog.accept)
     buttons.rejected.connect(dialog.reject)
     layout.addWidget(buttons)
     if dialog.exec_() != QDialog.Accepted:
         return
     if not valid_base(address.text().strip()) or not valid_host(host.text().strip()):
-        QMessageBox.warning(parent, "Настройки", "Укажите корректный адрес сервиса и ретранслятора.")
+        warn(parent, "Настройки", "Укажите корректный адрес сервиса и ретранслятора.")
         return
     if parent.ticket_id or any(getattr(parent, flag, False) for flag in ("_polling", "_queue_polling", "_creating", "_claiming")):
-        QMessageBox.warning(parent, "Настройки", "Настройки можно изменить только без активной заявки и ожидающих запросов.")
+        warn(parent, "Настройки", "Настройки можно изменить только без активной заявки и ожидающих запросов.")
         return
     values = dict(api_base=address.text().strip().rstrip("/"), tls_verify=verify.isChecked(),
                   relay_host=host.text().strip(), relay_port=port.value())
@@ -419,7 +443,7 @@ def _connection_settings(parent):
             if not valid_fps(requested_fps):
                 raise ValueError("FPS must be positive")
         except ValueError:
-            QMessageBox.warning(parent, "Настройки", "Введите целое число кадров в секунду больше нуля.")
+            warn(parent, "Настройки", "Введите целое число кадров в секунду больше нуля.")
             return
         values.update(video_fps=requested_fps, video_crf=crf.value())
     if not parent.save_preferences(**values):
