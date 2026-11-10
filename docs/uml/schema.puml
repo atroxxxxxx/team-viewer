@@ -1,0 +1,79 @@
+@startuml schema
+title Схема PostgreSQL сервиса заявок
+skinparam defaultFontName DejaVu Sans
+skinparam linetype ortho
+skinparam roundcorner 6
+skinparam class {
+  BackgroundColor #FFF8E8
+  BorderColor #C4A35A
+  HeaderBackgroundColor #1168BD
+  HeaderFontColor white
+}
+
+entity "shard_directory" as dir {
+  * shard_id : smallint
+  --
+  node_name
+  dsn
+  status : local | remote | moving
+}
+
+entity "ticket_index" as idx {
+  * ticket_id : uuid
+  --
+  shard_id
+  account_id
+}
+
+entity "tickets" as t {
+  * shard_id
+  * id : uuid
+  --
+  account_id
+  description
+  status
+  camera
+  assignee
+  token_hash
+  tunnel_id
+  created_at
+}
+
+entity "chat_messages" as chat
+entity "chat_members" as members
+entity "problems" as problems
+entity "plans" as plans
+entity "plan_steps" as steps {
+  position
+  status
+  body
+}
+entity "observations" as notes
+entity "control_grants" as grants
+entity "confirmations" as conf
+entity "action_log" as log {
+  intent
+  phase
+  detail jsonb
+}
+
+dir ||--o{ idx
+dir ||--o{ t
+t ||--o{ chat
+t ||--o{ members
+t ||--o{ problems
+t ||--o{ plans
+t ||--o{ grants
+t ||--o{ conf
+t ||--o{ log
+plans ||--o{ steps
+steps ||--o{ notes
+
+note bottom of t
+  Все таблицы заявок секционированы
+  LIST (shard_id) на четыре секции.
+  Первичный ключ начинается с shard_id.
+  ticket_index хранит только указатель
+  ticket_id -> shard_id.
+end note
+@enduml

@@ -1,0 +1,46 @@
+@startuml c4-container
+title C4. Уровень 2. Контейнеры
+skinparam defaultFontName DejaVu Sans
+skinparam shadowing false
+skinparam roundcorner 10
+skinparam padding 6
+skinparam rectangle {
+  BackgroundColor #438DD5
+  FontColor white
+  BorderColor #2E6295
+}
+skinparam database {
+  BackgroundColor #438DD5
+  FontColor white
+  BorderColor #2E6295
+}
+skinparam node {
+  BackgroundColor #FFFFFF
+  FontColor #333333
+  BorderColor #1168BD
+}
+
+rectangle "Клиент\nчеловек" as Client #08427B
+rectangle "Оператор\nчеловек или модель" as Operator #08427B
+
+node "Удалённая техподдержка" {
+  rectangle "Окно клиента\nPython, Qt\nисходящие HTTP и TCP" as ClientApp
+  rectangle "Окно оператора\nPython, Qt\nочередь, просмотр, план" as OpApp
+  rectangle "Nginx\nHTTPS или HTTP :8080" as Nginx
+  rectangle "Сервис заявок\nPython, FastAPI\n:18080" as Tickets
+  database "PostgreSQL 16\nзаявки, чат, план,\nжурнал, 4 секции" as DB
+  rectangle "Ретранслятор\nGo\nприём :18082, сессия :8554\nRTSP только 127.0.0.1:18554" as Relay
+  database "Redis 7\nтуннель 15 минут" as Cache
+}
+
+Client --> ClientApp
+Operator --> OpApp
+ClientApp --> Nginx : HTTPS, Basic и\nX-Ticket-Token
+OpApp --> Nginx : HTTPS, Basic
+Nginx --> Tickets : HTTP внутри хоста
+Tickets --> DB : SQL
+Tickets --> Relay : HTTP, Bearer
+ClientApp --> Relay : TCP, секрет клиента
+OpApp --> Relay : TCP, секрет оператора
+Relay --> Cache : запись туннеля
+@enduml
