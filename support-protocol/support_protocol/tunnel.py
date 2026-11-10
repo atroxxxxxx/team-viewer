@@ -5,10 +5,12 @@ import threading
 class LocalRTSPBridge:
     """Принимает RTSP от ffmpeg на localhost и отдаёт его в сессионный порт ретранслятора."""
 
-    def __init__(self, relay_host: str, relay_port: int, role: str, client_id: str):
+    def __init__(self, relay_host: str, relay_port: int, role: str, client_id: str, secret: str):
         self.relay_host = relay_host
         self.relay_port = int(relay_port)
-        self.hello = f"{role} {client_id}\n".encode()
+        if len(secret) != 64:
+            raise ValueError("нет секрета сессии")
+        self.hello = f"{role} {client_id} {secret}\n".encode()
         self.server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         self.server.bind(("127.0.0.1", 0))
