@@ -1,0 +1,29 @@
+@startuml story-session
+title История 1. Заявка и экран после захвата
+skinparam defaultFontName DejaVu Sans
+skinparam sequenceMessageAlign left
+autonumber
+
+actor "Клиент" as User
+participant "Окно клиента" as Client
+participant "Сервис заявок" as Tickets
+database "PostgreSQL" as DB
+participant "Ретранслятор" as Relay
+actor "Оператор" as Op
+
+User -> Client : Текст проблемы
+Client -> Tickets : POST /api/v1/tickets
+Tickets -> DB : queued, хеш токена
+Tickets --> Client : ticket_id и ticket_token
+
+Op -> Tickets : GET /api/v1/tickets
+Tickets --> Op : Очередь без uuid клиента
+Op -> Tickets : POST /tickets/{id}/claim
+Tickets -> Relay : POST /api/v1/tunnels
+Relay --> Tickets : tunnel_id и два секрета
+Tickets --> Op : секрет оператора
+Client -> Tickets : GET /session
+Tickets --> Client : секрет клиента
+Client -> Relay : CLIENT uuid и секрет клиента
+Op -> Relay : OPERATOR uuid и секрет оператора
+@enduml
