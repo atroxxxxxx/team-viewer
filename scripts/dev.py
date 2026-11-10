@@ -232,7 +232,8 @@ def serve(fake_relay):
 
     class DevRelay:
         def open(self, client_id, ticket_id, camera):
-            return uuid.uuid4()
+            from ticket_service.relay import OpenedTunnel
+            return OpenedTunnel(uuid.uuid4(), "c" * 64, "o" * 64)
 
         def close(self, ticket_id):
             pass

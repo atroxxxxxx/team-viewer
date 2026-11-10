@@ -33,7 +33,7 @@
         "responses": {"201": {"description": "заявка создана"}}
       },
       "get": {
-        "summary": "Очередь заявок со статусом queued",
+        "summary": "Очередь заявок со статусом queued, без uuid клиента и секретов сессии",
         "responses": {"200": {"description": "список"}}
       }
     },
@@ -46,13 +46,13 @@
     },
     "/api/v1/tickets/{id}/claim": {
       "post": {
-        "summary": "Утвердить заявку и положить туннель в ретранслятор",
+        "summary": "Утвердить заявку, открыть туннель и вернуть секрет оператора",
         "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}}],
         "responses": {"200": {"description": "туннель создан"}, "409": {"description": "уже занята"}, "502": {"description": "ретранслятор недоступен"}}
       }
     },
     "/api/v1/tickets/{id}/session": {
-      "get": {"summary": "Чат, план, грант, ожидающий ввод и подтверждения", "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}}], "responses": {"200": {"description": "снимок сессии"}}}
+      "get": {"summary": "Чат, план, грант и секрет своей роли. Чужому оператору только статус", "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}}], "responses": {"200": {"description": "снимок сессии"}}}
     },
     "/api/v1/tickets/{id}/messages": {
       "post": {"summary": "Сообщение чата", "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}}], "responses": {"201": {"description": "отправлено"}}}
@@ -84,8 +84,11 @@
     "/api/v1/tickets/{id}/problems": {
       "post": {"summary": "Дочерняя проблема и вложенный план", "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}}], "responses": {"201": {"description": "проблема создана"}}}
     },
+    "/api/v1/tickets/{id}/release": {
+      "post": {"summary": "Назначенный оператор возвращает открытую заявку в очередь", "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}}], "responses": {"200": {"description": "queued"}, "403": {"description": "заявка другого оператора"}, "409": {"description": "заявка уже завершена"}}}
+    },
     "/api/v1/tickets/{id}/resolution": {
-      "post": {"summary": "Подтверждение решения клиентом или оператором", "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}}], "responses": {"200": {"description": "статус сессии"}}}
+      "post": {"summary": "Решено клиента закрывает сразу. Не решено закрывает с комментарием. Предложение оператора ждёт клиента", "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}}], "responses": {"200": {"description": "статус сессии"}, "409": {"description": "у оператора остались открытые шаги"}}}
     }
   }
 }

@@ -1,4 +1,7 @@
+import re
 import shutil
+
+_DISPLAY = re.compile(r"^:[0-9]{1,2}(?:\.[0-9]{1,2})?$")
 
 FRAME_WIDTH = 640
 FRAME_HEIGHT = 360
@@ -30,7 +33,7 @@ def publish_args(url: str, mode: str, display: str, *, fps: int = DEFAULT_FPS, c
     if mode == "screen":
         return [
             ffmpeg, "-loglevel", "error", "-f", "x11grab", "-framerate", str(fps),
-            "-video_size", "1280x720", "-i", display,
+            "-video_size", "1280x720", "-i", display if _DISPLAY.fullmatch(display or "") else ":0",
             "-vf", f"scale={FRAME_WIDTH}:{FRAME_HEIGHT}", *output,
         ]
     if mode == "camera":

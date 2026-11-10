@@ -16,14 +16,14 @@ from PyQt5.QtWidgets import (
     QLabel,
     QLineEdit,
     QListWidget,
-    QMessageBox,
     QPushButton,
     QPlainTextEdit,
     QVBoxLayout,
     QWidget, QTabWidget, QScrollArea,
 )
 
-from support_protocol.ui import Background, STYLE, connection_settings, card, header, label, secondary, StatusLabel, CheckBox, sync_rows
+from support_protocol.labels import step_line, ticket_status
+from support_protocol.ui import Background, STYLE, ask_yes_no, connection_settings, card, header, label, secondary, StatusLabel, CheckBox, sync_rows
 from support_protocol.settings import UserSettings
 from support_protocol.api import TicketAPI
 from support_protocol.endpoints import config_file, load_endpoints
@@ -56,6 +56,7 @@ class ClientWindow(QWidget, Background):
         self.screen_failed = False
         self.next_start = 0.0
         self.bridge: LocalRTSPBridge | None = None
+        self.media_secret = ""
         self.answered_grant = ""
         self.handled_inputs: set[str] = set()
         self._input_queue = deque()
@@ -67,6 +68,9 @@ class ClientWindow(QWidget, Background):
         self.init_background()
         self._polling = False
         self._creating = False
+        self._status_until = 0.0
+        self._resolving = False
+        self._client_notice = ""
         self._build()
         self.timer = QTimer(self)
         self.timer.timeout.connect(self.refresh)
@@ -147,6 +151,7 @@ class ClientWindow(QWidget, Background):
         plan_layout.setSpacing(10)
         plan_layout.addWidget(label("План действий", "cardTitle"))
         plan_layout.addWidget(self.steps, 1)
+        plan_layout.addWidget(label("Ответ оператор увидит в чате и в этом списке", "muted"))
         plan_layout.addWidget(self.observation)
         plan_layout.addWidget(note)
         resolution = QHBoxLayout()
@@ -235,8 +240,14 @@ class ClientWindow(QWidget, Background):
         self._starting = True
         self.stop_media()
         gen = self.media_gen
+        if len(self.media_secret) != 64:
+            self.screen_failed = True
+            self.next_start = time.monotonic() + 2
+            self.status.setText("Нет ключа сессии")
+            self._starting = False
+            return
         try:
-            self.bridge = LocalRTSPBridge(self.relay_host, self.relay_port, "CLIENT", account_id)
+            self.bridge = LocalRTSPBridge(self.relay_host, self.relay_port, "CLIENT", account_id, self.media_secret)
             screen = self.bridge.url(f"/tunnels/{tunnel_id}/screen")
             screen_proc = self._publish("screen", screen, gen, "screen")
             if screen_proc is None:
@@ -282,26 +293,28 @@ class ClientWindow(QWidget, Background):
                 self._show_session(session)
         def failed(error):
             self._polling = False
-            self.report_error(error)
+            if ticket_id == self.ticket_id and not self._resolving:
+                self.report_error(error)
         self.run_background(lambda: self.api.session(ticket_id), done, failed)
 
     def _show_session(self, session: dict) -> None:
         ticket = session.get("ticket") or {}
         status = ticket.get("status", "")
         tunnel_id = ticket.get("tunnel_id") or ""
+        self.media_secret = str(session.get("media_secret") or "")
+        self._client_notice = str((session.get("handoff") or {}).get("client") or "") if status == "queued" else ""
         if not self._starting:
             action = media_action(self.tunnel_id, tunnel_id, status)
             if action == "stop":
                 self.stop_media()
-                self.status.setText(f"{status} · {self.ticket_id}")
-            elif action == "start" and time.monotonic() >= self.next_start:
+                self._show_status(status)
+            elif action == "start" and len(self.media_secret) == 64 and time.monotonic() >= self.next_start:
                 self._start_tunnel(ticket.get("account_id") or self.account_id, tunnel_id, bool(ticket.get("camera")))
             elif self.bridge is None:
-                self.status.setText(f"{status} · {self.ticket_id}")
+                self._show_status(status)
         lines = [f"{item.get('author')}: {item.get('body')}" for item in session.get("messages") or []]
         self.chat.setPlainText("\n".join(lines))
-        sync_rows(self.steps, [(str(step.get("id", "")), f"{step.get('status')} {step.get('id')} {step.get('body')}")
-                               for step in session.get("steps") or []])
+        sync_rows(self.steps, [(str(step.get("id", "")), step_line(step)) for step in session.get("steps") or []])
         if session_ended(status):
             self._cancel_inputs()
             self.stop_media()
@@ -325,8 +338,7 @@ class ClientWindow(QWidget, Background):
                 self.handled_inputs.add(action_id)
                 self._apply_input(action_id, item)
     def _ask_control(self, grant_id: str) -> None:
-        answer = QMessageBox.question(self, "Управление", "Разрешить оператору мышь и клавиатуру в этой сессии? Оболочка и удаление файлов недоступны.")
-        allow = answer == QMessageBox.Yes
+        allow = ask_yes_no(self, "Управление", "Разрешить оператору мышь и клавиатуру в этой сессии? Оболочка и удаление файлов недоступны.")
         ticket_id = self.ticket_id
         self.run_background(lambda: self.api.decide_control(ticket_id, grant_id, allow, "pointer,key,text" if allow else ""),
                             failed=lambda error: self._grant_failed(error))
@@ -358,8 +370,7 @@ class ClientWindow(QWidget, Background):
             detail = {}
         reason = validate_input(detail, self._control, FRAME_WIDTH, FRAME_HEIGHT)
         if reason is None and self.dangerous.isChecked():
-            confirm = QMessageBox.question(self, "Опасный диалог", "На экране системный диалог. Исполнить это событие?")
-            if confirm != QMessageBox.Yes:
+            if not ask_yes_no(self, "Опасный диалог", "На экране системный диалог. Исполнить это событие?"):
                 reason = "клиент остановил ввод на системном диалоге"
         # Модальный диалог обрабатывает события, в том числе завершение сеанса/отзыв гранта.
         if token.cancelled.is_set() or token is not self._input_session or self.ticket_id != ticket_id:
@@ -382,7 +393,7 @@ class ClientWindow(QWidget, Background):
                 QTimer.singleShot(0, self._drain_input)
 
         def failed(error):
-            if token is self._input_session and not token.cancelled.is_set():
+            if token is self._input_session and not token.cancelled.is_set() and self.ticket_id == ticket_id and not self._resolving:
                 self.report_error(error)
                 finished(None)
 
@@ -393,14 +404,18 @@ class ClientWindow(QWidget, Background):
         kind = event.get("type")
         if kind == "pointer":
             pointer = event.get("pointer") or {}
-            x = int(pointer["x"]) * self.scale
-            y = int(pointer["y"]) * self.scale
-            args = [xdotool, "mousemove", str(x), str(y), "click", "1"]
+            x, y = int(pointer["x"]), int(pointer["y"])
+            if not (0 <= x <= 10000 and 0 <= y <= 10000):
+                return "координаты отклонены"
+            args = [xdotool, "mousemove", str(x * self.scale), str(y * self.scale), "click", "1"]
         elif kind == "text":
-            args = [xdotool, "type", "--delay", "12", "--", str(event.get("text"))]
+            text = str(event.get("text") or "")
+            if not text or any(ord(ch) < 32 or ord(ch) == 127 for ch in text):
+                return "текст отклонён"
+            args = [xdotool, "type", "--delay", "12", "--", text]
         else:
             code = str((event.get("key") or {}).get("code") or "")
-            if not code.replace("_", "").isalnum():
+            if len(code) > 32 or not code.isascii() or not all(ch.isalnum() or ch == "_" for ch in code):
                 return "клавиша отклонена"
             args = [xdotool, "key", "--", code]
         try:
@@ -422,18 +437,86 @@ class ClientWindow(QWidget, Background):
         step_id, text, ticket_id = _selected_id(self.steps), self.observation.text().strip(), self.ticket_id
         if step_id and text and ticket_id:
             draft = self.observation.text()
-            self.run_background(lambda: self.api.observe(ticket_id, step_id, text),
-                                lambda _: self.observation.clear() if self.ticket_id == ticket_id and self.observation.text() == draft else None)
+            self._note("Отправляю ответ оператору...")
+            self.run_background(
+                lambda: self.api.observe(ticket_id, step_id, text),
+                lambda _: self._observation_sent(ticket_id, draft),
+            )
+
+    def _observation_sent(self, ticket_id: str, draft: str) -> None:
+        if self.ticket_id == ticket_id and self.observation.text() == draft:
+            self.observation.clear()
+        if self.ticket_id == ticket_id:
+            self._note("Ответ по шагу отправлен оператору: он в чате и в плане")
+
+    def _show_status(self, status: str) -> None:
+        if time.monotonic() < self._status_until:
+            return
+        if status == "queued" and self._client_notice:
+            self.status.setText(self._client_notice)
+            return
+        self.status.setText(ticket_status(status, self.ticket_id))
+
+    def _note(self, text: str) -> None:
+        self._status_until = time.monotonic() + 5
+        self.status.setText(text)
+
     def resolve(self, accept: bool) -> None:
         ticket_id = self.ticket_id
         if not ticket_id:
             return
-        if accept:
-            self.run_background(lambda: self.api.resolve(ticket_id, "client", True))
+        if not accept:
+            review = self._ask_unresolved()
+            if not review:
+                return
+            self._note("Отправляю отзыв и закрываю заявку...")
+            self._send_resolution(ticket_id, lambda: self.api.resolve(ticket_id, "client", False, review, close=True))
             return
-        review = self._ask_unresolved()
-        if review:
-            self.run_background(lambda: self.api.resolve(ticket_id, "client", False, review, close=True))
+        self._note("Закрываю заявку...")
+        self._send_resolution(ticket_id, lambda: self.api.resolve(ticket_id, "client", True))
+
+    def _send_resolution(self, ticket_id: str, call) -> None:
+        self._resolving = True
+
+        def done(result):
+            self._resolving = False
+            self._after_resolve(ticket_id, result)
+
+        def failed(error):
+            self._resolving = False
+            self._resolve_failed(ticket_id, error)
+
+        self.run_background(call, done, failed)
+
+    def _resolve_failed(self, ticket_id: str, error) -> None:
+        if self.ticket_id != ticket_id:
+            return
+
+        def done(session):
+            if self.ticket_id != ticket_id:
+                return
+            status = str((session.get("ticket") or {}).get("status") or "")
+            if session_ended(status):
+                self._status_until = 0.0
+                self._show_session(session)
+                return
+            self.report_error(error)
+
+        self.run_background(
+            lambda: self.api.session(ticket_id),
+            done,
+            lambda _error: self.report_error(error) if self.ticket_id == ticket_id else None,
+        )
+
+    def _after_resolve(self, ticket_id: str, result: dict) -> None:
+        if self.ticket_id != ticket_id:
+            return
+        status = str((result or {}).get("status") or "")
+        if session_ended(status):
+            self._status_until = 0.0
+            self._show_session({"ticket": {"status": status}})
+            return
+        self._note("Сервис не закрыл заявку. Повторите.")
 
     def _ask_unresolved(self) -> str:
         dialog = QDialog(self)
@@ -445,6 +528,8 @@ class ClientWindow(QWidget, Background):
         hint = QLabel("")
         hint.setWordWrap(True)
         buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.button(QDialogButtonBox.Ok).setText("Отправить")
+        buttons.button(QDialogButtonBox.Cancel).setText("Отмена")
 
         def accept_review() -> None:
             if not what.toPlainText().strip() or not why.toPlainText().strip():
@@ -452,8 +537,8 @@ class ClientWindow(QWidget, Background):
                 return
             dialog.accept()
 
-        buttons.accepted.connect(accept_review)
-        buttons.rejected.connect(dialog.reject)
+        buttons.button(QDialogButtonBox.Ok).clicked.connect(accept_review)
+        buttons.button(QDialogButtonBox.Cancel).clicked.connect(dialog.reject)
         layout = QVBoxLayout(dialog)
         layout.addWidget(label("Что не получилось", "cardTitle"))
         layout.addWidget(what)
@@ -499,5 +584,4 @@ def _selected_id(widget: QListWidget) -> str:
     item = widget.currentItem()
     if item is None:
         return ""
-    parts = item.text().split()
-    return parts[1] if len(parts) > 1 else ""
+    return str(item.data(Qt.UserRole) or "")

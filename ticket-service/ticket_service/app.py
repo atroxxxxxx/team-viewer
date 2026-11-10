@@ -16,7 +16,7 @@ from ticket_service.auth import Checker, Principal
 from ticket_service.grants import pick_controls
 from ticket_service.log import error, info
 from ticket_service.models import Ticket
-from ticket_service.policy import intent_allowed, normalize_scope, scope_allows, text_allowed
+from ticket_service.policy import intent_allowed, key_code_allowed, normalize_scope, scope_allows, text_allowed
 from ticket_service.relay import Relay
 from ticket_service.requests import CameraRequest, CompleteStepRequest, ControlDecision, ResolutionRequest
 from ticket_service.shard import shard_id
@@ -195,13 +195,25 @@ def build_app(factory: sessionmaker, creds: Checker, relay: Relay, shard_count: 
             return who
         if who.role != "operator":
             return JSONResponse({"error": "недостаточно прав"}, status_code=403)
+        now = datetime.now(timezone.utc)
         try:
             with factory() as session:
-                items = store.list_queued(session)
+                with unit(session):
+                    closed = store.expire_open(session, now)
+                    released = store.expire_operators(session, now)
+                items = []
+                for item in store.list_queued(session):
+                    row = _ticket(item, public=True)
+                    note = store.handoff_note(session, item.shard_id, item.id).get("operator") or ""
+                    if note:
+                        row["handoff"] = note
+                    items.append(row)
         except Exception as exc:
             error("list tickets", err=str(exc))
             return JSONResponse({"error": "не удалось прочитать очередь"}, status_code=500)
-        return {"tickets": [_ticket(item) for item in items]}
+        for ticket_id in [*closed, *released]:
+            _drop_tunnel(relay, ticket_id)
+        return {"tickets": items}
 
     @app.get("/api/v1/tickets/{ticket_id}")
     def get_one(ticket_id: str, request: Request):
@@ -221,7 +233,8 @@ def build_app(factory: sessionmaker, creds: Checker, relay: Relay, shard_count: 
                 ticket = store.get_ticket(session, shard, found_id)
             except Exception as exc:
                 return fail(exc)
-            return _ticket(ticket)
+            public = who.role == "operator" and ticket.assignee != who.operator_id
+            return _ticket(ticket, public=public)
 
     @app.post("/api/v1/tickets/{ticket_id}/claim")
     def claim(ticket_id: str, request: Request):
@@ -230,7 +243,7 @@ def build_app(factory: sessionmaker, creds: Checker, relay: Relay, shard_count: 
             return who
         if who.role != "operator":
             return JSONResponse({"error": "недостаточно прав"}, status_code=403)
-        tunnel = None
+        opened = None
         with factory() as session:
             located, problem = locate(session, ticket_id)
             if problem:
@@ -244,24 +257,26 @@ def build_app(factory: sessionmaker, creds: Checker, relay: Relay, shard_count: 
                     if ticket.status != "queued":
                         raise store.Conflict()
                     try:
-                        tunnel = relay.open(ticket.account_id, found_id, ticket.camera)
+                        opened = relay.open(ticket.account_id, found_id, ticket.camera)
                     except Exception as exc:
                         error("relay open", err=str(exc))
                         return JSONResponse({"error": "ретранслятор не принял заявку"}, status_code=502)
-                    store.claim(session, shard, found_id, who.operator_id, tunnel)
+                    store.claim(session, shard, found_id, who.operator_id, opened.tunnel_id, datetime.now(timezone.utc))
+                    store.save_tunnel_access(session, shard, found_id, opened.client_secret, opened.operator_secret)
             except Exception as exc:
-                if tunnel is not None:
+                if opened is not None:
                     try:
                         relay.close(found_id)
                     except Exception as close_exc:
                         error("relay close after claim", err=str(close_exc))
                 return fail(exc)
-        info("ticket claimed", ticket_id=str(found_id), tunnel_id=str(tunnel), shard_id=shard)
+        info("ticket claimed", ticket_id=str(found_id), tunnel_id=str(opened.tunnel_id), shard_id=shard)
         return {
             "ticket_id": str(found_id),
             "shard_id": shard,
             "account_id": str(ticket.account_id),
-            "tunnel_id": str(tunnel),
+            "tunnel_id": str(opened.tunnel_id),
+            "media_secret": opened.operator_secret,
             "camera": ticket.camera,
             "description": ticket.description,
         }
@@ -281,13 +296,46 @@ def build_app(factory: sessionmaker, creds: Checker, relay: Relay, shard_count: 
                 denied = require_token(session, shard, found_id, request)
                 if denied:
                     return denied
+            ended = False
+            try:
+                with unit(session):
+                    if who.role == "client":
+                        store.touch_client(session, shard, found_id, now)
+                    if who.role == "operator":
+                        current = store.get_ticket(session, shard, found_id)
+                        if current.assignee == who.operator_id and current.status not in ("resolved", "closed", "queued"):
+                            store.touch_operator(session, shard, found_id, who.operator_id, now)
+                    ended = store.expire_ticket(session, shard, found_id, now)
+                    released = store.expire_operators(session, now)
+            except Exception as exc:
+                return fail(exc)
+            if ended:
+                _drop_tunnel(relay, found_id)
+            for released_id in released:
+                if released_id != found_id or not ended:
+                    _drop_tunnel(relay, released_id)
             try:
                 ticket = store.get_ticket(session, shard, found_id)
+                note = store.handoff_note(session, shard, found_id)
+                owner = who.role == "client" or ticket.assignee == who.operator_id
+                if not owner:
+                    payload = {
+                        "ticket": _ticket(ticket, public=True),
+                        "messages": [],
+                        "steps": [],
+                        "inputs": [],
+                        "confirmations": [],
+                        "control": None,
+                        "owned": False,
+                    }
+                    if note:
+                        payload["handoff"] = {"operator": note.get("operator") or "", "client": note.get("client") or ""}
+                    return payload
                 control, pending = pick_controls(store.grants_for(session, shard, found_id), now)
                 notes: dict[str, list[dict]] = {}
-                for note in store.observations(session, shard, found_id):
-                    notes.setdefault(str(note.step_id), []).append(
-                        {"id": str(note.id), "body": note.body, "created_at": _time(note.created_at)}
+                for item in store.observations(session, shard, found_id):
+                    notes.setdefault(str(item.step_id), []).append(
+                        {"id": str(item.id), "body": item.body, "created_at": _time(item.created_at)}
                     )
             except Exception as exc:
                 return fail(exc)
@@ -299,9 +347,48 @@ def build_app(factory: sessionmaker, creds: Checker, relay: Relay, shard_count: 
                 "confirmations": [_confirmation(item) for item in store.confirmations(session, shard, found_id)],
                 "control": _grant(control),
             }
+            secret = store.media_secret(session, shard, found_id, who.role)
+            if secret:
+                payload["media_secret"] = secret
             if pending is not None and control is not pending:
                 payload["control_request"] = _grant(pending)
+            if note:
+                payload["handoff"] = {"operator": note.get("operator") or "", "client": note.get("client") or ""}
+            if who.role == "operator":
+                payload["owned"] = True
             return payload
+
+    @app.post("/api/v1/tickets/{ticket_id}/release")
+    def release(ticket_id: str, request: Request):
+        who = principal(request)
+        if isinstance(who, JSONResponse):
+            return who
+        if who.role != "operator":
+            return JSONResponse({"error": "это действие оператора"}, status_code=403)
+        parsed = _uuid(ticket_id, "id заявки должен быть uuid")
+        if isinstance(parsed, JSONResponse):
+            return parsed
+        now = datetime.now(timezone.utc)
+        released = False
+        with factory() as session:
+            try:
+                shard = store.locate(session, parsed)
+                ticket = store.get_ticket(session, shard, parsed)
+            except Exception as exc:
+                return fail(exc)
+            if ticket.assignee != who.operator_id:
+                return JSONResponse({"error": "заявка закреплена за другим оператором"}, status_code=403)
+            try:
+                with unit(session):
+                    released = store.release_operator(session, shard, parsed, now, "normal")
+                    status = store.get_ticket(session, shard, parsed).status
+            except Exception as exc:
+                return fail(exc)
+        if released:
+            _drop_tunnel(relay, parsed)
+        if not released and status in ("resolved", "closed"):
+            return fail(store.Conflict())
+        return {"status": status}
 
     @app.post("/api/v1/tickets/{ticket_id}/messages")
     async def post_message(ticket_id: str, request: Request):
@@ -381,6 +468,16 @@ def build_app(factory: sessionmaker, creds: Checker, relay: Relay, shard_count: 
             grant_id = None
         if grant_id is None or kind not in {"pointer", "key", "text"} or not intent_allowed(str(body.get("intent") or "")) or not text_allowed(text) or len(text) > 200:
             return JSONResponse({"error": "событие не проходит проверку схемы или правил"}, status_code=403)
+        if kind == "key" and not key_code_allowed(str((body.get("key") or {}).get("code") or "")):
+            return JSONResponse({"error": "событие не проходит проверку схемы или правил"}, status_code=403)
+        if kind == "pointer":
+            pointer = body.get("pointer") or {}
+            try:
+                px, py = int(pointer.get("x")), int(pointer.get("y"))
+            except (TypeError, ValueError):
+                return JSONResponse({"error": "событие не проходит проверку схемы или правил"}, status_code=403)
+            if not (0 <= px <= 10000 and 0 <= py <= 10000):
+                return JSONResponse({"error": "событие не проходит проверку схемы или правил"}, status_code=403)
         parsed = _uuid(ticket_id, "id заявки должен быть uuid")
         if isinstance(parsed, JSONResponse):
             return parsed
@@ -417,8 +514,11 @@ def build_app(factory: sessionmaker, creds: Checker, relay: Relay, shard_count: 
             return action
         body = await json_body(request)
         phase = body.get("phase")
+        observation = str(body.get("observation") or "").strip()
         if phase not in {"applied", "rejected_by_client"}:
             return JSONResponse({"error": "phase должна быть applied или rejected_by_client"}, status_code=400)
+        if len(observation) > 500 or not text_allowed(observation):
+            return JSONResponse({"error": "наблюдение слишком длинное или запрещено"}, status_code=400)
         with factory() as session:
             located, problem = locate(session, ticket_id)
             if problem:
@@ -429,7 +529,7 @@ def build_app(factory: sessionmaker, creds: Checker, relay: Relay, shard_count: 
                 return denied
             try:
                 with unit(session):
-                    store.finish_input(session, shard, found_id, action, phase, str(body.get("observation") or "").strip())
+                    store.finish_input(session, shard, found_id, action, phase, observation)
             except Exception as exc:
                 return fail(exc)
         return {"phase": phase}
@@ -453,7 +553,8 @@ def build_app(factory: sessionmaker, creds: Checker, relay: Relay, shard_count: 
             shard, _ticket_row = gate
             try:
                 with unit(session):
-                    store.log_blocked(session, shard, parsed, who.role, intent, {"detail": str(body.get("detail") or "")})
+                    detail = str(body.get("detail") or "")[:500]
+                    store.log_blocked(session, shard, parsed, who.role, intent, {"detail": detail})
             except Exception as exc:
                 return fail(exc)
         return JSONResponse({"phase": "blocked_by_policy"}, status_code=201)
@@ -497,8 +598,8 @@ def build_app(factory: sessionmaker, creds: Checker, relay: Relay, shard_count: 
             return JSONResponse({"error": "это действие клиента"}, status_code=403)
         body = await json_body(request)
         text = str(body.get("body") or "").strip()
-        if not text or not text_allowed(text):
-            return JSONResponse({"error": "наблюдение пустое или запрещено"}, status_code=400)
+        if not text or len(text) > 4000 or not text_allowed(text):
+            return JSONResponse({"error": "наблюдение пустое, слишком длинное или запрещено"}, status_code=400)
         parsed = _uuid(ticket_id, "id заявки должен быть uuid")
         step = _uuid(step_id, "step должен быть uuid")
         if isinstance(parsed, JSONResponse):
@@ -515,7 +616,7 @@ def build_app(factory: sessionmaker, creds: Checker, relay: Relay, shard_count: 
                 return denied
             try:
                 with unit(session):
-                    store.add_observation(session, shard, found_id, step, text)
+                    store.add_observation(session, shard, found_id, step, text, announce=True)
             except Exception as exc:
                 return fail(exc)
         return JSONResponse({"status": "noted"}, status_code=201)
@@ -637,21 +738,27 @@ def build_app(factory: sessionmaker, creds: Checker, relay: Relay, shard_count: 
                     return gate
                 shard, _ticket_row = gate
                 found_id = parsed
+            closed_now = False
             try:
                 with unit(session):
                     if close:
                         status = store.close_unresolved(session, shard, found_id, who.role, comment, now)
+                    elif who.role == "client" and accept:
+                        status = store.close_resolved(session, shard, found_id, who.role, now)
                     else:
                         if comment:
                             store.add_message(session, shard, found_id, who.role, comment)
                         status = store.confirm(session, shard, found_id, who.role, accept, now)
+                    closed_now = status in ("resolved", "closed")
+            except store.Conflict:
+                ticket = store.get_ticket(session, shard, found_id)
+                status = ticket.status
+                if status not in ("resolved", "closed"):
+                    return fail(store.Conflict())
             except Exception as exc:
                 return fail(exc)
-        if status in ("resolved", "closed"):
-            try:
-                relay.close(found_id)
-            except Exception as exc:
-                error("relay close", err=str(exc), ticket_id=str(found_id))
+        if closed_now:
+            _drop_tunnel(relay, found_id)
         return {"status": status}
 
     async def _participant_write(request: Request, ticket_id: str, writer):
@@ -693,6 +800,13 @@ def build_app(factory: sessionmaker, creds: Checker, relay: Relay, shard_count: 
     return app
 
 
+def _drop_tunnel(relay, ticket_id) -> None:
+    try:
+        relay.close(ticket_id)
+    except Exception as exc:
+        error("relay close", err=str(exc), ticket_id=str(ticket_id))
+
+
 def _uuid(value: str, message: str):
     try:
         return uuid.UUID(value)
@@ -700,16 +814,18 @@ def _uuid(value: str, message: str):
         return JSONResponse({"error": message}, status_code=400)
 
 
-def _ticket(ticket: Ticket) -> dict:
+def _ticket(ticket: Ticket, public: bool = False) -> dict:
     out = {
         "ticket_id": str(ticket.id),
         "shard_id": ticket.shard_id,
-        "account_id": str(ticket.account_id),
         "description": ticket.description,
         "status": ticket.status,
         "camera": ticket.camera,
         "created_at": _time(ticket.created_at),
     }
+    if public:
+        return out
+    out["account_id"] = str(ticket.account_id)
     if ticket.tunnel_id is not None:
         out["tunnel_id"] = str(ticket.tunnel_id)
     return out
