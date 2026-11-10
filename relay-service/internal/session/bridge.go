@@ -3,12 +3,16 @@ package session
 import (
 	"bufio"
 	"context"
+	"crypto/sha256"
+	"crypto/subtle"
 	"io"
 	"net"
 	"strings"
 	"time"
 
 	"relay-service/internal/logx"
+
+	"github.com/google/uuid"
 )
 
 type Bridge struct {
@@ -46,17 +50,18 @@ func (b *Bridge) Serve(ctx context.Context) error {
 func (b *Bridge) handle(front net.Conn) {
 	defer front.Close()
 	_ = front.SetReadDeadline(time.Now().Add(5 * time.Second))
-	reader := bufio.NewReader(front)
+	reader := bufio.NewReader(io.LimitReader(front, 256))
 	line, err := reader.ReadString('\n')
-	if err != nil {
+	if err != nil || len(line) > 200 {
 		return
 	}
 	_ = front.SetReadDeadline(time.Time{})
-	role, clientID, ok := parseHello(line)
+	role, clientID, secret, ok := parseHello(line)
 	if !ok {
 		return
 	}
-	if _, err := b.store.ByClient(context.Background(), clientID); err != nil {
+	item, err := b.store.ByClient(context.Background(), clientID)
+	if err != nil || !item.allows(role, secret) {
 		logx.Info("session denied", map[string]any{"role": role})
 		return
 	}
@@ -88,14 +93,38 @@ func (b *Bridge) handle(front net.Conn) {
 	<-done
 }
 
-func parseHello(line string) (role, clientID string, ok bool) {
+func parseHello(line string) (role, clientID, secret string, ok bool) {
 	fields := strings.Fields(strings.TrimSpace(line))
-	if len(fields) != 2 {
-		return "", "", false
+	if len(fields) != 3 {
+		return "", "", "", false
 	}
 	role = strings.ToUpper(fields[0])
 	if role != "CLIENT" && role != "OPERATOR" {
-		return "", "", false
+		return "", "", "", false
 	}
-	return role, fields[1], true
+	if _, err := uuid.Parse(fields[1]); err != nil {
+		return "", "", "", false
+	}
+	if len(fields[2]) != 64 {
+		return "", "", "", false
+	}
+	return role, fields[1], fields[2], true
+}
+
+func (item Tunnel) allows(role, secret string) bool {
+	var want string
+	switch role {
+	case "CLIENT":
+		want = item.ClientSecret
+	case "OPERATOR":
+		want = item.OperatorSecret
+	default:
+		return false
+	}
+	if len(want) != 64 || len(secret) != 64 {
+		return false
+	}
+	gotSum := sha256.Sum256([]byte(secret))
+	wantSum := sha256.Sum256([]byte(want))
+	return subtle.ConstantTimeCompare(gotSum[:], wantSum[:]) == 1
 }
