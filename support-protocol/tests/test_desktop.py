@@ -368,6 +368,36 @@ def test_closed_ticket_ends_operator_session(app, windows):
     assert o.status.text() == "Заявка завершена"
 
 
+def test_client_sees_switch_when_operator_leaves(app, windows):
+    c, _ = windows
+    c.ticket_id = "ticket"
+    c._show_session({
+        "ticket": {"status": "queued"},
+        "handoff": {"client": "Переключение на другого оператора"},
+    })
+    assert c.ticket_id == "ticket"
+    assert c.status.text() == "Переключение на другого оператора"
+
+
+def test_operator_drops_ticket_returned_to_queue(app, windows):
+    _, o = windows
+    o.ticket_id = "ticket"
+    o.reload_queue = lambda: None
+    o.session = {"ticket": {"status": "queued"}, "owned": False}
+    o._show_session()
+    assert o.ticket_id == ""
+    assert o.status.text() == "Заявка вернулась в очередь"
+
+
+def test_closing_operator_releases_open_ticket(app, windows):
+    _, o = windows
+    sent = []
+    o.ticket_id = "ticket"
+    o.api.release = lambda ticket_id: sent.append(ticket_id) or {}
+    o.close()
+    assert sent == ["ticket"]
+
+
 def test_unresolved_button_sends_review(app, windows, monkeypatch):
     c, _ = windows
     c.ticket_id = "ticket"

@@ -56,6 +56,7 @@ class ClientWindow(QWidget, Background):
         self.screen_failed = False
         self.next_start = 0.0
         self.bridge: LocalRTSPBridge | None = None
+        self.media_secret = ""
         self.answered_grant = ""
         self.handled_inputs: set[str] = set()
         self._input_queue = deque()
@@ -68,6 +69,8 @@ class ClientWindow(QWidget, Background):
         self._polling = False
         self._creating = False
         self._status_until = 0.0
+        self._resolving = False
+        self._client_notice = ""
         self._build()
         self.timer = QTimer(self)
         self.timer.timeout.connect(self.refresh)
@@ -237,8 +240,14 @@ class ClientWindow(QWidget, Background):
         self._starting = True
         self.stop_media()
         gen = self.media_gen
+        if len(self.media_secret) != 64:
+            self.screen_failed = True
+            self.next_start = time.monotonic() + 2
+            self.status.setText("Нет ключа сессии")
+            self._starting = False
+            return
         try:
-            self.bridge = LocalRTSPBridge(self.relay_host, self.relay_port, "CLIENT", account_id)
+            self.bridge = LocalRTSPBridge(self.relay_host, self.relay_port, "CLIENT", account_id, self.media_secret)
             screen = self.bridge.url(f"/tunnels/{tunnel_id}/screen")
             screen_proc = self._publish("screen", screen, gen, "screen")
             if screen_proc is None:
@@ -284,19 +293,22 @@ class ClientWindow(QWidget, Background):
                 self._show_session(session)
         def failed(error):
             self._polling = False
-            self.report_error(error)
+            if ticket_id == self.ticket_id and not self._resolving:
+                self.report_error(error)
         self.run_background(lambda: self.api.session(ticket_id), done, failed)
 
     def _show_session(self, session: dict) -> None:
         ticket = session.get("ticket") or {}
         status = ticket.get("status", "")
         tunnel_id = ticket.get("tunnel_id") or ""
+        self.media_secret = str(session.get("media_secret") or "")
+        self._client_notice = str((session.get("handoff") or {}).get("client") or "") if status == "queued" else ""
         if not self._starting:
             action = media_action(self.tunnel_id, tunnel_id, status)
             if action == "stop":
                 self.stop_media()
                 self._show_status(status)
-            elif action == "start" and time.monotonic() >= self.next_start:
+            elif action == "start" and len(self.media_secret) == 64 and time.monotonic() >= self.next_start:
                 self._start_tunnel(ticket.get("account_id") or self.account_id, tunnel_id, bool(ticket.get("camera")))
             elif self.bridge is None:
                 self._show_status(status)
@@ -381,7 +393,7 @@ class ClientWindow(QWidget, Background):
                 QTimer.singleShot(0, self._drain_input)
 
         def failed(error):
-            if token is self._input_session and not token.cancelled.is_set():
+            if token is self._input_session and not token.cancelled.is_set() and self.ticket_id == ticket_id and not self._resolving:
                 self.report_error(error)
                 finished(None)
 
@@ -392,14 +404,18 @@ class ClientWindow(QWidget, Background):
         kind = event.get("type")
         if kind == "pointer":
             pointer = event.get("pointer") or {}
-            x = int(pointer["x"]) * self.scale
-            y = int(pointer["y"]) * self.scale
-            args = [xdotool, "mousemove", str(x), str(y), "click", "1"]
+            x, y = int(pointer["x"]), int(pointer["y"])
+            if not (0 <= x <= 10000 and 0 <= y <= 10000):
+                return "координаты отклонены"
+            args = [xdotool, "mousemove", str(x * self.scale), str(y * self.scale), "click", "1"]
         elif kind == "text":
-            args = [xdotool, "type", "--delay", "12", "--", str(event.get("text"))]
+            text = str(event.get("text") or "")
+            if not text or any(ord(ch) < 32 or ord(ch) == 127 for ch in text):
+                return "текст отклонён"
+            args = [xdotool, "type", "--delay", "12", "--", text]
         else:
             code = str((event.get("key") or {}).get("code") or "")
-            if not code.replace("_", "").isalnum():
+            if len(code) > 32 or not code.isascii() or not all(ch.isalnum() or ch == "_" for ch in code):
                 return "клавиша отклонена"
             args = [xdotool, "key", "--", code]
         try:
@@ -436,6 +452,9 @@ class ClientWindow(QWidget, Background):
     def _show_status(self, status: str) -> None:
         if time.monotonic() < self._status_until:
             return
+        if status == "queued" and self._client_notice:
+            self.status.setText(self._client_notice)
+            return
         self.status.setText(ticket_status(status, self.ticket_id))
 
     def _note(self, text: str) -> None:
@@ -451,15 +470,42 @@ class ClientWindow(QWidget, Background):
             if not review:
                 return
             self._note("Отправляю отзыв и закрываю заявку...")
-            self.run_background(
-                lambda: self.api.resolve(ticket_id, "client", False, review, close=True),
-                lambda result: self._after_resolve(ticket_id, result),
-            )
+            self._send_resolution(ticket_id, lambda: self.api.resolve(ticket_id, "client", False, review, close=True))
             return
         self._note("Закрываю заявку...")
+        self._send_resolution(ticket_id, lambda: self.api.resolve(ticket_id, "client", True))
+
+    def _send_resolution(self, ticket_id: str, call) -> None:
+        self._resolving = True
+
+        def done(result):
+            self._resolving = False
+            self._after_resolve(ticket_id, result)
+
+        def failed(error):
+            self._resolving = False
+            self._resolve_failed(ticket_id, error)
+
+        self.run_background(call, done, failed)
+
+    def _resolve_failed(self, ticket_id: str, error) -> None:
+        if self.ticket_id != ticket_id:
+            return
+
+        def done(session):
+            if self.ticket_id != ticket_id:
+                return
+            status = str((session.get("ticket") or {}).get("status") or "")
+            if session_ended(status):
+                self._status_until = 0.0
+                self._show_session(session)
+                return
+            self.report_error(error)
+
         self.run_background(
-            lambda: self.api.resolve(ticket_id, "client", True),
-            lambda result: self._after_resolve(ticket_id, result),
+            lambda: self.api.session(ticket_id),
+            done,
+            lambda _error: self.report_error(error) if self.ticket_id == ticket_id else None,
         )
 
     def _after_resolve(self, ticket_id: str, result: dict) -> None:

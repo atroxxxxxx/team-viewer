@@ -53,6 +53,7 @@ class OperatorWindow(QWidget, Background):
         self.playing_tunnel = ""
         self.play_gen = 0
         self.bridge: LocalRTSPBridge | None = None
+        self.media_secret = ""
         self.session: dict = {}
         self.player: QProcess | None = None
         self.buffer = bytearray()
@@ -231,9 +232,15 @@ class OperatorWindow(QWidget, Background):
         def done(tickets):
             self._queue_polling = False
             self.service_recovered()
-            snapshot = [(str(t.get("ticket_id", "")), str(t.get("description", ""))) for t in tickets]
+            snapshot = [
+                (str(t.get("ticket_id", "")), str(t.get("description", "")), str(t.get("handoff") or ""))
+                for t in tickets
+            ]
             if snapshot != self._queue_snapshot:
-                sync_rows(self.queue, [(ticket_id, f"{ticket_id} {description[:80]}") for ticket_id, description in snapshot])
+                sync_rows(self.queue, [
+                    (ticket_id, f"{ticket_id} {description[:80]}" + (f" — {handoff}" if handoff else ""))
+                    for ticket_id, description, handoff in snapshot
+                ])
                 self._queue_snapshot = snapshot
             if not self.ticket_id and time.monotonic() >= self._status_until:
                 self.status.setText(f"Заявок в очереди: {len(tickets)}" if tickets else "Очередь пуста")
@@ -258,6 +265,7 @@ class OperatorWindow(QWidget, Background):
             self._claiming = False
             self.ticket_id = ticket_id
             self._note(f"Заявка {ticket_id} захвачена")
+            self.media_secret = str(claimed.get("media_secret") or "")
             self._sync_player(claimed["account_id"], claimed["tunnel_id"], "assigned")
         def failed(error):
             self._claiming = False
@@ -268,7 +276,7 @@ class OperatorWindow(QWidget, Background):
             self._stop_play()
             return
         running = self.player is not None and self.player.state() != QProcess.NotRunning
-        if account_id and should_open_player(self.playing_tunnel, tunnel_id, running, status):
+        if account_id and len(self.media_secret) == 64 and should_open_player(self.playing_tunnel, tunnel_id, running, status):
             self._play(account_id, tunnel_id)
 
     def _stop_play(self) -> None:
@@ -293,7 +301,7 @@ class OperatorWindow(QWidget, Background):
         self._stop_play()
         gen = self.play_gen
         self.playing_tunnel = tunnel_id
-        self.bridge = LocalRTSPBridge(self.relay_host, self.relay_port, "OPERATOR", account_id)
+        self.bridge = LocalRTSPBridge(self.relay_host, self.relay_port, "OPERATOR", account_id, self.media_secret)
         url = self.bridge.url(f"/tunnels/{tunnel_id}/screen")
         try:
             args = play_args(url)
@@ -394,10 +402,26 @@ class OperatorWindow(QWidget, Background):
 
     def _show_session(self) -> None:
         ticket = self.session.get("ticket") or {}
+        secret = str(self.session.get("media_secret") or "")
+        if secret:
+            self.media_secret = secret
         self._sync_player(ticket.get("account_id") or "", ticket.get("tunnel_id") or "", ticket.get("status") or "")
-        ended = session_ended(ticket.get("status") or "")
+        status = ticket.get("status") or ""
+        if status == "queued" or self.session.get("owned") is False:
+            self._stop_play()
+            self.ticket_id = ""
+            self.media_secret = ""
+            self.session = {}
+            self.frame = None
+            self.preview.clear()
+            self.preview.setText("Экран появится после захвата")
+            self._note("Заявка вернулась в очередь")
+            self.reload_queue()
+            return
+        ended = session_ended(status)
+        notice = str((self.session.get("handoff") or {}).get("operator") or "")
         if ended or time.monotonic() >= self._status_until:
-            self.status.setText(ticket_status(ticket.get("status") or "", self.ticket_id))
+            self.status.setText(notice or ticket_status(status, self.ticket_id))
         if ended:
             self.ticket_id = ""
             self.session = {}
@@ -593,6 +617,13 @@ class OperatorWindow(QWidget, Background):
             self._status_until = time.monotonic() + 5
 
     def closeEvent(self, event) -> None:
+        ticket_id = self.ticket_id
+        self.ticket_id = ""
+        if ticket_id:
+            try:
+                self.api.release(ticket_id)
+            except Exception:
+                pass
         self.close_background()
         for job in list(self._model_jobs):
             job.kill()
