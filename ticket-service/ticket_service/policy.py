@@ -60,5 +60,11 @@ def normalize_scope(scope: str) -> str | None:
 
 
 def text_allowed(text: str) -> bool:
+    if any(ord(ch) < 32 or ord(ch) == 127 for ch in text):
+        return False
     folded = text.lower()
     return not any(item in folded for item in FORBIDDEN_TEXT)
+
+
+def key_code_allowed(code: str) -> bool:
+    return bool(code) and len(code) <= 32 and code.isascii() and all(ch.isalnum() or ch == "_" for ch in code)
