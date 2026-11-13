@@ -15,6 +15,8 @@ import (
 	"github.com/google/uuid"
 )
 
+const maxHelloBytes = 200
+
 type Bridge struct {
 	addr     string
 	rtspAddr string
@@ -50,16 +52,12 @@ func (b *Bridge) Serve(ctx context.Context) error {
 func (b *Bridge) handle(front net.Conn) {
 	defer front.Close()
 	_ = front.SetReadDeadline(time.Now().Add(5 * time.Second))
-	reader := bufio.NewReader(io.LimitReader(front, 256))
-	line, err := reader.ReadString('\n')
-	if err != nil || len(line) > 200 {
-		return
-	}
-	_ = front.SetReadDeadline(time.Time{})
-	role, clientID, secret, ok := parseHello(line)
+	reader := bufio.NewReaderSize(front, maxHelloBytes)
+	role, clientID, secret, ok := readHello(reader)
 	if !ok {
 		return
 	}
+	_ = front.SetReadDeadline(time.Time{})
 	item, err := b.store.ByClient(context.Background(), clientID)
 	if err != nil || !item.allows(role, secret) {
 		logx.Info("session denied", map[string]any{"role": role})
@@ -71,18 +69,10 @@ func (b *Bridge) handle(front net.Conn) {
 		return
 	}
 	defer back.Close()
-	if reader.Buffered() > 0 {
-		pending := make([]byte, reader.Buffered())
-		if _, err := io.ReadFull(reader, pending); err != nil {
-			return
-		}
-		if _, err := back.Write(pending); err != nil {
-			return
-		}
-	}
 	logx.Info("session joined", map[string]any{"role": role, "client_id": clientID})
 	done := make(chan struct{}, 2)
 	go func() {
+		// Keep using reader so bytes buffered alongside the hello reach RTSP.
 		_, _ = io.Copy(back, reader)
 		done <- struct{}{}
 	}()
@@ -91,6 +81,14 @@ func (b *Bridge) handle(front net.Conn) {
 		done <- struct{}{}
 	}()
 	<-done
+}
+
+func readHello(reader *bufio.Reader) (role, clientID, secret string, ok bool) {
+	line, err := reader.ReadSlice('\n')
+	if err != nil || len(line) > maxHelloBytes {
+		return "", "", "", false
+	}
+	return parseHello(string(line))
 }
 
 func parseHello(line string) (role, clientID, secret string, ok bool) {
