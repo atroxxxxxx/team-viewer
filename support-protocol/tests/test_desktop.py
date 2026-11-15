@@ -33,9 +33,9 @@ def pump(app, predicate, timeout=2):
 def windows(app, monkeypatch, tmp_path):
     monkeypatch.setenv("SUPPORT_SETTINGS_DIR", str(tmp_path))
     monkeypatch.setattr(client_module, "STATE", tmp_path / "client-id")
-    monkeypatch.setattr(operator_module, "STATE", tmp_path / "operator-id")
     monkeypatch.setattr(TicketAPI, "health", lambda self: {"status": "ok"})
     monkeypatch.setattr(TicketAPI, "list_queued", lambda self: [])
+    monkeypatch.setattr(TicketAPI, "release", lambda self, ticket_id: {})
     c, o = client_module.ClientWindow(), operator_module.OperatorWindow()
     pump(app, lambda: not o._tasks)
     yield c, o
@@ -136,7 +136,6 @@ def test_client_outage_recovery_without_changing_settings(app, windows, during_s
 
 def test_operator_down_at_start_and_automatic_recovery(app, monkeypatch, tmp_path):
     monkeypatch.setenv("SUPPORT_SETTINGS_DIR", str(tmp_path))
-    monkeypatch.setattr(operator_module, "STATE", tmp_path / "id")
     def down(_): raise ServiceUnavailable()
     monkeypatch.setattr(TicketAPI, "list_queued", down)
     o = operator_module.OperatorWindow()
@@ -268,7 +267,7 @@ def test_queued_input_rechecks_session_and_permission(app, windows, end_session)
         else:
             c._control = {"status": "revoked"}
         release.set()
-        pump(app, lambda: pool.activeThreadCount() == 0)
+        pump(app, lambda: not c._input_busy and pool.activeThreadCount() == 0)
         app.processEvents()
         assert not injected
         if not end_session:
@@ -392,10 +391,23 @@ def test_operator_drops_ticket_returned_to_queue(app, windows):
 def test_closing_operator_releases_open_ticket(app, windows):
     _, o = windows
     sent = []
+    released = threading.Event()
     o.ticket_id = "ticket"
-    o.api.release = lambda ticket_id: sent.append(ticket_id) or {}
-    o.close()
-    assert sent == ["ticket"]
+
+    def release(ticket_id):
+        sent.append(ticket_id)
+        assert released.wait(2)
+        return {}
+
+    o.api.release = release
+    o.show()
+    try:
+        assert not o.close()
+        pump(app, lambda: bool(sent))
+        assert sent == ["ticket"] and o.isVisible() and o._releasing
+    finally:
+        released.set()
+    pump(app, lambda: not o.isVisible() and o._closing)
 
 
 def test_unresolved_button_sends_review(app, windows, monkeypatch):
@@ -571,9 +583,14 @@ def test_client_publishes_60_after_loading_old_15_profile(app, monkeypatch, tmp_
         captured = []
         monkeypatch.setattr(client_module, "publish_args", lambda *a, **kw: captured.append(kw) or ["not-started"])
         class Process:
+            NotRunning = 0
+            def state(self): return self.NotRunning
             def __init__(self, *_):
                 self.finished = SimpleSignal()
                 self.errorOccurred = SimpleSignal()
+                self.readyReadStandardError = SimpleSignal()
+                self.readyReadStandardOutput = SimpleSignal()
+            def readAllStandardOutput(self): return b""
             def start(self, *_): pass
             def kill(self): pass
             def deleteLater(self): pass
@@ -604,3 +621,94 @@ def test_fps_dialog_accepts_user_rate_above_previous_cap(app, windows, fps):
     QTimer.singleShot(0, apply)
     connection_settings(c)
     assert UserSettings("client").get("video_fps") == fps
+
+def test_chat_refresh_keeps_selection_and_scroll(app, windows):
+    from PyQt5.QtGui import QTextCursor
+    from support_protocol.ui import sync_chat
+
+    _, operator = windows
+    operator.show()
+    operator.findChild(QTabWidget).setCurrentIndex(1)
+    messages = [{"author": "client", "body": str(i)} for i in range(200)]
+    sync_chat(operator.chat, messages)
+    app.processEvents()
+    cursor = operator.chat.textCursor()
+    cursor.setPosition(9)
+    cursor.setPosition(12, QTextCursor.KeepAnchor)
+    operator.chat.setTextCursor(cursor)
+    scroll = operator.chat.verticalScrollBar()
+    scroll.setValue(scroll.maximum() // 2)
+    saved = scroll.value(), operator.chat.textCursor().selectedText()
+    assert saved[0] > 0 and saved[1]
+    sync_chat(operator.chat, messages)
+    assert (scroll.value(), operator.chat.textCursor().selectedText()) == saved
+    sync_chat(operator.chat, messages + [{"author": "client", "body": "new"}])
+    assert (scroll.value(), operator.chat.textCursor().selectedText()) == saved
+
+
+def test_camera_process_is_deleted_after_failure(app, windows, monkeypatch):
+    import sys
+    from PyQt5.QtCore import QEvent, QProcess
+
+    client, _ = windows
+    monkeypatch.setattr(client_module, "publish_args", lambda *a, **k: [sys.executable, "-c", "raise SystemExit(1)"])
+    client._publish("camera", "rtsp://localhost/camera", client.media_gen, "camera")
+    pump(app, lambda: not client.procs)
+    app.sendPostedEvents(None, QEvent.DeferredDelete)
+    assert not client.findChildren(QProcess)
+
+def test_input_result_retries_without_repeating_local_input(app, windows):
+    from support_protocol.errors import ServiceUnavailable
+
+    client, _ = windows
+    _grant(client)
+    local_calls, acknowledgements = [], []
+
+    def inject(*args):
+        local_calls.append(args)
+        return "ввод исполнен в сессии клиента"
+
+    def finish(*args):
+        acknowledgements.append(args)
+        if len(acknowledgements) == 1:
+            raise ServiceUnavailable()
+
+    client._inject = inject
+    client.api.finish_input = finish
+    item = {"id": "retry", "detail": {"type": "text", "intent": "type_in_field", "text": "hello"}}
+    session = {"ticket": {"status": "remote_control"}, "inputs": [item], "control": client._control}
+    client._show_session(session)
+    pump(app, lambda: len(acknowledgements) == 1 and not client._input_busy)
+    client._show_session(session)
+    pump(app, lambda: len(acknowledgements) == 2 and not client._input_busy)
+    assert len(local_calls) == 1
+    assert acknowledgements[0] == acknowledgements[1]
+
+
+def test_publisher_retains_only_stderr_tail(app, windows, monkeypatch):
+    import sys
+
+    client, _ = windows
+    script = "import sys,time; sys.stderr.buffer.write(b'x'*65536); sys.stderr.flush(); time.sleep(2)"
+    monkeypatch.setattr(client_module, "publish_args", lambda *a, **k: [sys.executable, "-c", script])
+    proc = client._publish("screen", "rtsp://localhost/screen", client.media_gen, "screen")
+    try:
+        pump(app, lambda: len(proc.stderr_tail) == 8192)
+        assert proc.stderr_tail == b"x" * 8192
+        assert proc.readAllStandardError().isEmpty()
+    finally:
+        proc.kill()
+        pump(app, lambda: not client.procs)
+
+
+def test_queue_keeps_id_separate_from_description(app, windows):
+    _, operator = windows
+    ticket = "12345678-1234-1234-1234-123456789abc"
+    description = "Экран гаснет при переключении"
+    operator.api.list_queued = lambda: [{"ticket_id": ticket, "description": description}]
+    operator.reload_queue()
+    pump(app, lambda: operator.queue.count() == 1)
+    item = operator.queue.item(0)
+    assert item.text() == description
+    assert item.data(Qt.UserRole) == ticket
+    assert ticket in item.toolTip()

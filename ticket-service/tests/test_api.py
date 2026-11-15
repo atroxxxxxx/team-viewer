@@ -17,6 +17,7 @@ from ticket_service.models import ActionLog, Confirmation, ControlGrant, Observa
 pytestmark = pytest.mark.integration
 CLIENT = ("client", "test-client")
 OPERATOR = ("operator", "test-operator")
+OTHER_OPERATOR = ("other", "test-other")
 INVALID_BOOLS = ["false", "true", 0, 1, None, [], {}]
 
 
@@ -41,9 +42,13 @@ class RelayStub:
         self.tunnels[ticket_id] = tunnel
         return OpenedTunnel(tunnel, "c" * 64, "o" * 64)
 
-    def close(self, ticket_id):
+    def close(self, ticket_id, tunnel_id):
         self.closes.append(ticket_id)
-        self.tunnels.pop(ticket_id, None)
+        if self.tunnels.get(ticket_id) == tunnel_id:
+            self.tunnels.pop(ticket_id, None)
+
+    def renew(self, ticket_id, tunnel_id):
+        return self.tunnels.get(ticket_id) == tunnel_id
 
 
 class API:
@@ -94,7 +99,7 @@ class API:
 @pytest.fixture
 def api(factory):
     relay = RelayStub()
-    app = build_app(factory, Checker(*CLIENT, *OPERATOR), relay, 4, "/openapi/tickets.json")
+    app = build_app(factory, Checker(*CLIENT, *OPERATOR, dict([OTHER_OPERATOR])), relay, 4, "/openapi/tickets.json")
     with TestClient(app) as http:
         yield API(http, relay)
 
@@ -403,3 +408,196 @@ def test_concurrent_confirmations_close_once(api):
         assert second.result(timeout=10).status_code == 200
     assert api.session()["ticket"]["status"] == "resolved"
     assert len(api.relay.closes) == 1
+
+
+def test_close_without_solution_accepts_multiline_feedback_and_revokes_session(api, factory):
+    api.claim()
+    api.allow_control()
+    reason = "Проблема осталась\nСбой повторяется"
+    response = api.client("/resolution", {"accept": False, "close": True, "comment": reason})
+    assert response.status_code == 200
+    assert response.json()["status"] == "closed"
+    assert api.relay.closes == [uuid.UUID(api.id)]
+    snapshot = api.session()
+    assert snapshot["control"] == {}
+    assert snapshot["messages"][-1]["body"] == reason
+    assert "media_secret" not in snapshot
+    with factory() as session:
+        ticket = session.scalar(select(Ticket).where(Ticket.id == uuid.UUID(api.id)))
+        assert ticket.client_media_secret is None and ticket.operator_media_secret is None
+        assert session.scalar(select(ActionLog).where(ActionLog.intent == "tunnel_access")) is None
+    assert api.client("/messages", {"body": "после закрытия"}).status_code == 409
+
+
+def test_session_can_omit_unchanged_chat_history(api):
+    def snapshot(known):
+        return api.http.get(api.path + "/session", auth=CLIENT, headers=api.headers,
+                            params={"known_messages": known}).json()
+
+    assert "messages" not in snapshot(0)
+    assert api.client("/messages", {"body": "один"}).status_code == 201
+    assert [msg["body"] for msg in snapshot(0)["messages"]] == ["один"]
+    assert "messages" not in snapshot(1)
+    assert "messages" in api.session()
+
+def test_migrate_legacy_media_secrets_without_losing_active_session(api, factory):
+    from ticket_service.db import ensure_tunnel_access
+
+    claimed = api.claim()
+    with factory.begin() as session:
+        ticket = session.get(Ticket, (claimed["shard_id"], uuid.UUID(api.id)))
+        ticket.client_media_secret = ticket.operator_media_secret = None
+        log_id = uuid.uuid4()
+        session.add(ActionLog(
+            id=log_id, shard_id=ticket.shard_id, ticket_id=ticket.id, actor="service",
+            intent="tunnel_access", phase="applied",
+            detail={"client_secret": "c" * 64, "operator_secret": "o" * 64, "note": "keep"},
+        ))
+
+    ensure_tunnel_access(factory)
+    ensure_tunnel_access(factory)
+    assert api.session()["media_secret"] == "c" * 64
+    with factory() as session:
+        entry = session.get(ActionLog, (claimed["shard_id"], log_id))
+        assert entry.detail == {"note": "keep"}
+
+def test_late_release_removes_only_old_tunnel(api):
+    old = api.claim()["tunnel_id"]
+    started, resume = threading.Event(), threading.Event()
+    close = api.relay.close
+
+    def delayed_close(ticket_id, tunnel_id):
+        started.set()
+        assert resume.wait(3)
+        close(ticket_id, tunnel_id)
+
+    api.relay.close = delayed_close
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        releasing = executor.submit(api.operator, "/release")
+        try:
+            assert started.wait(3)
+            replacement = api.claim()["tunnel_id"]
+            assert replacement != old
+        finally:
+            resume.set()
+        assert releasing.result(timeout=3).json()["status"] == "queued"
+    assert str(api.relay.tunnels[uuid.UUID(api.id)]) == replacement
+
+
+def test_failed_relay_revoke_retries_from_database(api, factory):
+    from ticket_service.maintenance import maintain
+    from ticket_service.models import RelayRevocation
+
+    tunnel_id = uuid.UUID(api.claim()["tunnel_id"])
+    close = api.relay.close
+
+    def unavailable(ticket_id, tunnel_id):
+        raise ConnectionError("test relay unavailable")
+
+    api.relay.close = unavailable
+    assert api.client("/resolution", {"accept": True}).json()["status"] == "resolved"
+    with factory() as session:
+        job = session.get(RelayRevocation, tunnel_id)
+        assert job is not None
+        due = job.retry_at
+    api.relay.close = close
+    maintain(factory, api.relay, due + timedelta(seconds=1))
+    assert uuid.UUID(api.id) not in api.relay.tunnels
+    with factory() as session:
+        assert session.get(RelayRevocation, tunnel_id) is None
+
+
+def test_live_ticket_renews_lease_and_missing_lease_returns_to_queue(api, factory):
+    from ticket_service.maintenance import maintain
+
+    claimed = api.claim()
+    key = (claimed["shard_id"], uuid.UUID(api.id))
+    due = datetime.now(timezone.utc)
+    with factory.begin() as session:
+        session.get(Ticket, key).media_renew_at = due
+    maintain(factory, api.relay, due + timedelta(seconds=1))
+    with factory() as session:
+        assert session.get(Ticket, key).media_renew_at > due
+    api.relay.tunnels.clear()
+    with factory.begin() as session:
+        session.get(Ticket, key).media_renew_at = due
+    maintain(factory, api.relay, due + timedelta(seconds=1))
+    snapshot = api.session()
+    assert snapshot["ticket"]["status"] == "queued"
+    assert "media_secret" not in snapshot
+
+
+def test_operator_assignment_is_scoped_to_account_and_claim(api):
+    previous = api.claim()["tunnel_id"]
+    denied = api.http.get(api.path + "/session", auth=OTHER_OPERATOR)
+    assert denied.json()["owned"] is False and "media_secret" not in denied.json()
+    assert api.http.post(api.path + "/release", auth=OTHER_OPERATOR).status_code == 403
+    assert api.operator("/release").status_code == 200
+    current = api.claim()["tunnel_id"]
+    assert current != previous
+    stale = {"X-Support-Tunnel": previous}
+    assert api.http.post(api.path + "/release", auth=OPERATOR, headers=stale).status_code == 403
+    assert api.http.get(api.path + "/session", auth=OPERATOR, headers=stale).json()["owned"] is False
+    assert api.session()["ticket"]["tunnel_id"] == current
+
+
+def test_unchanged_steps_need_no_payload(api):
+    api.claim()
+
+    def snapshot(known):
+        return api.http.get(api.path + "/session", auth=CLIENT, headers=api.headers,
+                            params={"known_steps": known}).json()
+
+    initial = snapshot(-1)
+    assert initial["steps"] == []
+    assert "steps" not in snapshot(initial["steps_revision"])
+    assert api.operator("/plans", {"steps": ["Проверить"]}).status_code == 201
+    changed = snapshot(initial["steps_revision"])
+    assert changed["steps"][0]["body"] == "Проверить"
+    assert changed["steps_revision"] != initial["steps_revision"]
+
+
+def test_queue_query_count_does_not_grow(api, postgres_engine):
+    from sqlalchemy import event
+
+    calls = []
+    def track(*args):
+        calls.append(args[2])
+    def count():
+        calls.clear()
+        response = api.http.get("/api/v1/tickets", auth=OPERATOR)
+        assert response.status_code == 200
+        return len(calls)
+
+    event.listen(postgres_engine, "before_cursor_execute", track)
+    try:
+        initial = count()
+        for _ in range(19):
+            api.http.post("/api/v1/tickets", auth=CLIENT, json={
+                "account_id": str(uuid.uuid4()), "description": "Тестовая заявка"
+            })
+        assert count() == initial == 1
+    finally:
+        event.remove(postgres_engine, "before_cursor_execute", track)
+
+
+def test_slow_resolution_does_not_block_health(api):
+    api.claim()
+    entered, unblock = threading.Event(), threading.Event()
+    close = api.relay.close
+
+    def slow_close(ticket_id, tunnel_id):
+        entered.set()
+        assert unblock.wait(3)
+        close(ticket_id, tunnel_id)
+
+    api.relay.close = slow_close
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        resolution = executor.submit(api.client, "/resolution", {"accept": True})
+        try:
+            assert entered.wait(2)
+            health = executor.submit(api.http.get, "/health")
+            assert health.result(timeout=1).status_code == 200
+        finally:
+            unblock.set()
+        assert resolution.result(timeout=2).status_code == 200

@@ -1,8 +1,10 @@
+import asyncio
 import json
 import uuid
-from contextlib import contextmanager
+from contextlib import asynccontextmanager, contextmanager, suppress
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from functools import wraps
 
 from pydantic import BaseModel, ValidationError
 from sqlalchemy import text
@@ -10,11 +12,13 @@ from sqlalchemy import text
 from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse, JSONResponse
 from sqlalchemy.orm import Session, sessionmaker
+from starlette.concurrency import run_in_threadpool
 
 from ticket_service import store
 from ticket_service.auth import Checker, Principal
 from ticket_service.grants import pick_controls
 from ticket_service.log import error, info
+from ticket_service.maintenance import maintain, revoke
 from ticket_service.models import Ticket
 from ticket_service.policy import intent_allowed, key_code_allowed, normalize_scope, scope_allows, text_allowed
 from ticket_service.relay import Relay
@@ -29,9 +33,23 @@ class InvalidBody(ValueError):
     pass
 
 
-async def json_body(request: Request, schema: type[BaseModel] | None = None) -> dict:
+def blocking_json(handler):
+    @wraps(handler)
+    async def dispatch(*args, request: Request, **kwargs):
+        raw = bytearray()
+        async for chunk in request.stream():
+            if len(raw) + len(chunk) > 1 << 20:
+                return JSONResponse({"error": "некорректное тело"}, status_code=413)
+            raw.extend(chunk)
+        request.state.raw_json = raw
+        return await run_in_threadpool(handler, *args, request=request, **kwargs)
+
+    return dispatch
+
+
+def json_body(request: Request, schema: type[BaseModel] | None = None) -> dict:
     try:
-        body = await request.json()
+        body = json.loads(request.state.raw_json)
     except (json.JSONDecodeError, UnicodeDecodeError) as exc:
         raise InvalidBody() from exc
     if not isinstance(body, dict):
@@ -56,7 +74,25 @@ GRANT_TTL = timedelta(minutes=30)
 
 
 def build_app(factory: sessionmaker, creds: Checker, relay: Relay, shard_count: int, swagger_url: str) -> FastAPI:
-    app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
+    async def maintain_loop():
+        while True:
+            await asyncio.sleep(3)
+            try:
+                await run_in_threadpool(maintain, factory, relay)
+            except Exception as exc:
+                error("maintenance", err=str(exc))
+
+    @asynccontextmanager
+    async def lifespan(_app):
+        job = asyncio.create_task(maintain_loop())
+        try:
+            yield
+        finally:
+            job.cancel()
+            with suppress(asyncio.CancelledError):
+                await job
+
+    app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None, lifespan=lifespan)
     spec = SPEC.read_bytes()
 
     @app.exception_handler(InvalidBody)
@@ -65,7 +101,8 @@ def build_app(factory: sessionmaker, creds: Checker, relay: Relay, shard_count: 
 
     @app.middleware("http")
     async def access(request: Request, call_next):
-        if request.headers.get("content-length") and int(request.headers["content-length"]) > 1 << 20:
+        length = request.headers.get("content-length", "")
+        if length and (not length.isascii() or not length.isdecimal() or len(length) > 10 or int(length) > 1 << 20):
             return JSONResponse({"error": "некорректное тело"}, status_code=413)
         started = datetime.now(timezone.utc)
         response = await call_next(request)
@@ -141,26 +178,27 @@ def build_app(factory: sessionmaker, creds: Checker, relay: Relay, shard_count: 
             return JSONResponse({"error": "токен заявки не подходит"}, status_code=403)
         return None
 
-    def assignee_ticket(session: Session, who: Principal, ticket_id: uuid.UUID) -> tuple[int, Ticket] | JSONResponse:
+    def assignee_ticket(session: Session, who: Principal, ticket_id: uuid.UUID, request: Request, *, allow_terminal=False) -> tuple[int, Ticket] | JSONResponse:
         if who.role != "operator":
             return JSONResponse({"error": "это действие оператора"}, status_code=403)
         try:
             shard = store.locate(session, ticket_id)
-            ticket = store.get_ticket(session, shard, ticket_id)
+            ticket = store.lock_ticket(session, shard, ticket_id, allow_terminal=allow_terminal)
         except Exception as exc:
             return fail(exc)
-        if ticket.assignee != who.operator_id:
+        if not _owns_assignment(who, ticket, request):
             return JSONResponse({"error": "заявка закреплена за другим оператором"}, status_code=403)
         return shard, ticket
 
     @app.post("/api/v1/tickets")
-    async def create_ticket(request: Request):
+    @blocking_json
+    def create_ticket(request: Request):
         who = principal(request)
         if isinstance(who, JSONResponse):
             return who
         if who.role != "client":
             return JSONResponse({"error": "недостаточно прав"}, status_code=403)
-        body = await json_body(request, CameraRequest)
+        body = json_body(request, CameraRequest)
         try:
             account_id = uuid.UUID(str(body.get("account_id", "")))
         except ValueError:
@@ -195,24 +233,18 @@ def build_app(factory: sessionmaker, creds: Checker, relay: Relay, shard_count: 
             return who
         if who.role != "operator":
             return JSONResponse({"error": "недостаточно прав"}, status_code=403)
-        now = datetime.now(timezone.utc)
         try:
             with factory() as session:
-                with unit(session):
-                    closed = store.expire_open(session, now)
-                    released = store.expire_operators(session, now)
                 items = []
-                for item in store.list_queued(session):
-                    row = _ticket(item, public=True)
-                    note = store.handoff_note(session, item.shard_id, item.id).get("operator") or ""
+                for ticket, detail in store.list_queued(session):
+                    row = _ticket(ticket, public=True)
+                    note = (detail or {}).get("operator")
                     if note:
                         row["handoff"] = note
                     items.append(row)
         except Exception as exc:
             error("list tickets", err=str(exc))
             return JSONResponse({"error": "не удалось прочитать очередь"}, status_code=500)
-        for ticket_id in [*closed, *released]:
-            _drop_tunnel(relay, ticket_id)
         return {"tickets": items}
 
     @app.get("/api/v1/tickets/{ticket_id}")
@@ -262,11 +294,14 @@ def build_app(factory: sessionmaker, creds: Checker, relay: Relay, shard_count: 
                         error("relay open", err=str(exc))
                         return JSONResponse({"error": "ретранслятор не принял заявку"}, status_code=502)
                     store.claim(session, shard, found_id, who.operator_id, opened.tunnel_id, datetime.now(timezone.utc))
-                    store.save_tunnel_access(session, shard, found_id, opened.client_secret, opened.operator_secret)
+                    ticket.client_media_secret = opened.client_secret
+                    ticket.operator_media_secret = opened.operator_secret
             except Exception as exc:
                 if opened is not None:
                     try:
-                        relay.close(found_id)
+                        with factory.begin() as recovery:
+                            store.schedule_revoke(recovery, found_id, opened.tunnel_id, datetime.now(timezone.utc))
+                        _try_revoke(factory, relay, opened.tunnel_id)
                     except Exception as close_exc:
                         error("relay close after claim", err=str(close_exc))
                 return fail(exc)
@@ -282,7 +317,8 @@ def build_app(factory: sessionmaker, creds: Checker, relay: Relay, shard_count: 
         }
 
     @app.get("/api/v1/tickets/{ticket_id}/session")
-    def get_session(ticket_id: str, request: Request):
+    def get_session(ticket_id: str, request: Request, known_messages: int | None = None,
+                    known_steps: int | None = None):
         who = principal(request)
         if isinstance(who, JSONResponse):
             return who
@@ -296,28 +332,30 @@ def build_app(factory: sessionmaker, creds: Checker, relay: Relay, shard_count: 
                 denied = require_token(session, shard, found_id, request)
                 if denied:
                     return denied
-            ended = False
             try:
                 with unit(session):
-                    if who.role == "client":
-                        store.touch_client(session, shard, found_id, now)
-                    if who.role == "operator":
-                        current = store.get_ticket(session, shard, found_id)
-                        if current.assignee == who.operator_id and current.status not in ("resolved", "closed", "queued"):
+                    try:
+                        current = store.lock_ticket(session, shard, found_id)
+                    except store.Conflict:
+                        current = None
+                    if current is not None:
+                        if who.role == "client":
+                            store.touch_client(session, shard, found_id, now)
+                        if who.role == "operator" and _owns_assignment(who, current, request):
                             store.touch_operator(session, shard, found_id, who.operator_id, now)
-                    ended = store.expire_ticket(session, shard, found_id, now)
-                    released = store.expire_operators(session, now)
+                        revoked = current.tunnel_id
+                        ended = store.expire_ticket(session, shard, found_id, now)
+                        released = not ended and store.expire_operator(session, current, now)
+                    else:
+                        ended = released = False
             except Exception as exc:
                 return fail(exc)
-            if ended:
-                _drop_tunnel(relay, found_id)
-            for released_id in released:
-                if released_id != found_id or not ended:
-                    _drop_tunnel(relay, released_id)
+            if ended or released:
+                _try_revoke(factory, relay, revoked)
             try:
                 ticket = store.get_ticket(session, shard, found_id)
                 note = store.handoff_note(session, shard, found_id)
-                owner = who.role == "client" or ticket.assignee == who.operator_id
+                owner = who.role == "client" or _owns_assignment(who, ticket, request)
                 if not owner:
                     payload = {
                         "ticket": _ticket(ticket, public=True),
@@ -332,22 +370,27 @@ def build_app(factory: sessionmaker, creds: Checker, relay: Relay, shard_count: 
                         payload["handoff"] = {"operator": note.get("operator") or "", "client": note.get("client") or ""}
                     return payload
                 control, pending = pick_controls(store.grants_for(session, shard, found_id), now)
-                notes: dict[str, list[dict]] = {}
-                for item in store.observations(session, shard, found_id):
-                    notes.setdefault(str(item.step_id), []).append(
-                        {"id": str(item.id), "body": item.body, "created_at": _time(item.created_at)}
-                    )
+                payload = {
+                    "ticket": _ticket(ticket),
+                    "steps_revision": ticket.steps_revision,
+                    "inputs": [_log(item) for item in store.pending_inputs(session, shard, found_id)],
+                    "control": _grant(control),
+                }
+                if known_steps != ticket.steps_revision:
+                    notes: dict[str, list[dict]] = {}
+                    for item in store.observations(session, shard, found_id):
+                        notes.setdefault(str(item.step_id), []).append(
+                            {"id": str(item.id), "body": item.body, "created_at": _time(item.created_at)}
+                        )
+                    payload["steps"] = [_step(item, notes.get(str(item.id), []))
+                                        for item in store.steps(session, shard, found_id)]
             except Exception as exc:
                 return fail(exc)
-            payload = {
-                "ticket": _ticket(ticket),
-                "messages": [_message(item) for item in store.messages(session, shard, found_id)],
-                "steps": [_step(item, notes.get(str(item.id), [])) for item in store.steps(session, shard, found_id)],
-                "inputs": [_log(item) for item in store.pending_inputs(session, shard, found_id)],
-                "confirmations": [_confirmation(item) for item in store.confirmations(session, shard, found_id)],
-                "control": _grant(control),
-            }
-            secret = store.media_secret(session, shard, found_id, who.role)
+            if known_messages is None or known_messages != store.message_count(session, shard, found_id):
+                payload["messages"] = [_message(item) for item in store.messages(session, shard, found_id)]
+            if known_messages is None:
+                payload["confirmations"] = [_confirmation(item) for item in store.confirmations(session, shard, found_id)]
+            secret = store.media_secret(ticket, who.role)
             if secret:
                 payload["media_secret"] = secret
             if pending is not None and control is not pending:
@@ -369,37 +412,34 @@ def build_app(factory: sessionmaker, creds: Checker, relay: Relay, shard_count: 
         if isinstance(parsed, JSONResponse):
             return parsed
         now = datetime.now(timezone.utc)
-        released = False
         with factory() as session:
-            try:
-                shard = store.locate(session, parsed)
-                ticket = store.get_ticket(session, shard, parsed)
-            except Exception as exc:
-                return fail(exc)
-            if ticket.assignee != who.operator_id:
-                return JSONResponse({"error": "заявка закреплена за другим оператором"}, status_code=403)
+            gate = assignee_ticket(session, who, parsed, request)
+            if isinstance(gate, JSONResponse):
+                return gate
+            shard, ticket = gate
+            tunnel_id = ticket.tunnel_id
             try:
                 with unit(session):
-                    released = store.release_operator(session, shard, parsed, now, "normal")
-                    status = store.get_ticket(session, shard, parsed).status
+                    released = store.release_operator(session, shard, parsed, now, "normal", tunnel_id, who.operator_id)
+                    status = ticket.status
             except Exception as exc:
                 return fail(exc)
         if released:
-            _drop_tunnel(relay, parsed)
-        if not released and status in ("resolved", "closed"):
-            return fail(store.Conflict())
+            _try_revoke(factory, relay, tunnel_id)
         return {"status": status}
 
     @app.post("/api/v1/tickets/{ticket_id}/messages")
-    async def post_message(ticket_id: str, request: Request):
-        return await _participant_write(request, ticket_id, _message_body)
+    @blocking_json
+    def post_message(ticket_id: str, request: Request):
+        return _participant_write(request, ticket_id, _message_body)
 
     @app.post("/api/v1/tickets/{ticket_id}/control-requests")
-    async def request_control(ticket_id: str, request: Request):
+    @blocking_json
+    def request_control(ticket_id: str, request: Request):
         who = principal(request)
         if isinstance(who, JSONResponse):
             return who
-        body = await json_body(request)
+        body = json_body(request)
         intent = str(body.get("intent") or "")
         if not intent_allowed(intent):
             return JSONResponse({"error": "намерение запрещено"}, status_code=403)
@@ -407,7 +447,7 @@ def build_app(factory: sessionmaker, creds: Checker, relay: Relay, shard_count: 
             parsed = _uuid(ticket_id, "id заявки должен быть uuid")
             if isinstance(parsed, JSONResponse):
                 return parsed
-            gate = assignee_ticket(session, who, parsed)
+            gate = assignee_ticket(session, who, parsed, request)
             if isinstance(gate, JSONResponse):
                 return gate
             shard, _ticket_row = gate
@@ -419,7 +459,8 @@ def build_app(factory: sessionmaker, creds: Checker, relay: Relay, shard_count: 
         return JSONResponse({"grant_id": str(grant_id), "status": "pending"}, status_code=201)
 
     @app.post("/api/v1/tickets/{ticket_id}/control-requests/{grant_id}/decision")
-    async def decide(ticket_id: str, grant_id: str, request: Request):
+    @blocking_json
+    def decide(ticket_id: str, grant_id: str, request: Request):
         who = principal(request)
         if isinstance(who, JSONResponse):
             return who
@@ -431,7 +472,7 @@ def build_app(factory: sessionmaker, creds: Checker, relay: Relay, shard_count: 
             return parsed
         if isinstance(grant, JSONResponse):
             return grant
-        body = await json_body(request, ControlDecision)
+        body = json_body(request, ControlDecision)
         allow = body["allow"]
         scope = "pointer,key,text"
         if allow and str(body.get("scope") or "").strip():
@@ -455,11 +496,12 @@ def build_app(factory: sessionmaker, creds: Checker, relay: Relay, shard_count: 
         return {"allow": allow, "scope": scope}
 
     @app.post("/api/v1/tickets/{ticket_id}/input")
-    async def post_input(ticket_id: str, request: Request):
+    @blocking_json
+    def post_input(ticket_id: str, request: Request):
         who = principal(request)
         if isinstance(who, JSONResponse):
             return who
-        body = await json_body(request)
+        body = json_body(request)
         kind = body.get("type")
         text = str(body.get("text") or "")
         try:
@@ -482,7 +524,7 @@ def build_app(factory: sessionmaker, creds: Checker, relay: Relay, shard_count: 
         if isinstance(parsed, JSONResponse):
             return parsed
         with factory() as session:
-            gate = assignee_ticket(session, who, parsed)
+            gate = assignee_ticket(session, who, parsed, request)
             if isinstance(gate, JSONResponse):
                 return gate
             shard, _ticket_row = gate
@@ -500,7 +542,8 @@ def build_app(factory: sessionmaker, creds: Checker, relay: Relay, shard_count: 
         return JSONResponse({"action_id": str(action_id), "phase": "proposed"}, status_code=201)
 
     @app.post("/api/v1/tickets/{ticket_id}/input/{action_id}/result")
-    async def finish_input(ticket_id: str, action_id: str, request: Request):
+    @blocking_json
+    def finish_input(ticket_id: str, action_id: str, request: Request):
         who = principal(request)
         if isinstance(who, JSONResponse):
             return who
@@ -512,7 +555,7 @@ def build_app(factory: sessionmaker, creds: Checker, relay: Relay, shard_count: 
             return parsed
         if isinstance(action, JSONResponse):
             return action
-        body = await json_body(request)
+        body = json_body(request)
         phase = body.get("phase")
         observation = str(body.get("observation") or "").strip()
         if phase not in {"applied", "rejected_by_client"}:
@@ -535,11 +578,12 @@ def build_app(factory: sessionmaker, creds: Checker, relay: Relay, shard_count: 
         return {"phase": phase}
 
     @app.post("/api/v1/tickets/{ticket_id}/actions")
-    async def blocked(ticket_id: str, request: Request):
+    @blocking_json
+    def blocked(ticket_id: str, request: Request):
         who = principal(request)
         if isinstance(who, JSONResponse):
             return who
-        body = await json_body(request)
+        body = json_body(request)
         intent = str(body.get("intent") or "").strip()
         if not intent:
             return JSONResponse({"error": "нужно намерение"}, status_code=400)
@@ -547,7 +591,7 @@ def build_app(factory: sessionmaker, creds: Checker, relay: Relay, shard_count: 
         if isinstance(parsed, JSONResponse):
             return parsed
         with factory() as session:
-            gate = assignee_ticket(session, who, parsed)
+            gate = assignee_ticket(session, who, parsed, request)
             if isinstance(gate, JSONResponse):
                 return gate
             shard, _ticket_row = gate
@@ -560,11 +604,12 @@ def build_app(factory: sessionmaker, creds: Checker, relay: Relay, shard_count: 
         return JSONResponse({"phase": "blocked_by_policy"}, status_code=201)
 
     @app.post("/api/v1/tickets/{ticket_id}/plans")
-    async def post_plan(ticket_id: str, request: Request):
+    @blocking_json
+    def post_plan(ticket_id: str, request: Request):
         who = principal(request)
         if isinstance(who, JSONResponse):
             return who
-        body = await json_body(request)
+        body = json_body(request)
         raw_steps = body.get("steps") or []
         if not isinstance(raw_steps, list) or not raw_steps or len(raw_steps) > 20:
             return JSONResponse({"error": "нужен хотя бы один шаг и не больше 20"}, status_code=400)
@@ -578,7 +623,7 @@ def build_app(factory: sessionmaker, creds: Checker, relay: Relay, shard_count: 
         if isinstance(parsed, JSONResponse):
             return parsed
         with factory() as session:
-            gate = assignee_ticket(session, who, parsed)
+            gate = assignee_ticket(session, who, parsed, request)
             if isinstance(gate, JSONResponse):
                 return gate
             shard, _ticket_row = gate
@@ -590,13 +635,14 @@ def build_app(factory: sessionmaker, creds: Checker, relay: Relay, shard_count: 
         return JSONResponse({"plan_id": str(plan_id)}, status_code=201)
 
     @app.post("/api/v1/tickets/{ticket_id}/steps/{step_id}/observations")
-    async def observe(ticket_id: str, step_id: str, request: Request):
+    @blocking_json
+    def observe(ticket_id: str, step_id: str, request: Request):
         who = principal(request)
         if isinstance(who, JSONResponse):
             return who
         if who.role != "client":
             return JSONResponse({"error": "это действие клиента"}, status_code=403)
-        body = await json_body(request)
+        body = json_body(request)
         text = str(body.get("body") or "").strip()
         if not text or len(text) > 4000 or not text_allowed(text):
             return JSONResponse({"error": "наблюдение пустое, слишком длинное или запрещено"}, status_code=400)
@@ -622,11 +668,12 @@ def build_app(factory: sessionmaker, creds: Checker, relay: Relay, shard_count: 
         return JSONResponse({"status": "noted"}, status_code=201)
 
     @app.post("/api/v1/tickets/{ticket_id}/steps/{step_id}/complete")
-    async def complete(ticket_id: str, step_id: str, request: Request):
+    @blocking_json
+    def complete(ticket_id: str, step_id: str, request: Request):
         who = principal(request)
         if isinstance(who, JSONResponse):
             return who
-        body = await json_body(request, CompleteStepRequest)
+        body = json_body(request, CompleteStepRequest)
         parsed = _uuid(ticket_id, "id заявки должен быть uuid")
         step = _uuid(step_id, "step должен быть uuid")
         if isinstance(parsed, JSONResponse):
@@ -634,7 +681,7 @@ def build_app(factory: sessionmaker, creds: Checker, relay: Relay, shard_count: 
         if isinstance(step, JSONResponse):
             return step
         with factory() as session:
-            gate = assignee_ticket(session, who, parsed)
+            gate = assignee_ticket(session, who, parsed, request)
             if isinstance(gate, JSONResponse):
                 return gate
             shard, _ticket_row = gate
@@ -646,11 +693,12 @@ def build_app(factory: sessionmaker, creds: Checker, relay: Relay, shard_count: 
         return {"status": "done"}
 
     @app.post("/api/v1/tickets/{ticket_id}/steps/{step_id}/revise")
-    async def revise(ticket_id: str, step_id: str, request: Request):
+    @blocking_json
+    def revise(ticket_id: str, step_id: str, request: Request):
         who = principal(request)
         if isinstance(who, JSONResponse):
             return who
-        body = await json_body(request)
+        body = json_body(request)
         text = str(body.get("body") or "").strip()
         if not text_allowed(text):
             return JSONResponse({"error": "новый текст шага запрещён"}, status_code=403)
@@ -661,7 +709,7 @@ def build_app(factory: sessionmaker, creds: Checker, relay: Relay, shard_count: 
         if isinstance(step, JSONResponse):
             return step
         with factory() as session:
-            gate = assignee_ticket(session, who, parsed)
+            gate = assignee_ticket(session, who, parsed, request)
             if isinstance(gate, JSONResponse):
                 return gate
             shard, _ticket_row = gate
@@ -673,11 +721,12 @@ def build_app(factory: sessionmaker, creds: Checker, relay: Relay, shard_count: 
         return {"status": "revised"}
 
     @app.post("/api/v1/tickets/{ticket_id}/problems")
-    async def problem(ticket_id: str, request: Request):
+    @blocking_json
+    def problem(ticket_id: str, request: Request):
         who = principal(request)
         if isinstance(who, JSONResponse):
             return who
-        body = await json_body(request)
+        body = json_body(request)
         steps = body.get("steps") or []
         description = str(body.get("description") or "").strip()
         try:
@@ -692,7 +741,7 @@ def build_app(factory: sessionmaker, creds: Checker, relay: Relay, shard_count: 
         if isinstance(parsed, JSONResponse):
             return parsed
         with factory() as session:
-            gate = assignee_ticket(session, who, parsed)
+            gate = assignee_ticket(session, who, parsed, request)
             if isinstance(gate, JSONResponse):
                 return gate
             shard, _ticket_row = gate
@@ -704,11 +753,12 @@ def build_app(factory: sessionmaker, creds: Checker, relay: Relay, shard_count: 
         return JSONResponse({"problem_id": str(problem_id)}, status_code=201)
 
     @app.post("/api/v1/tickets/{ticket_id}/resolution")
-    async def resolution(ticket_id: str, request: Request):
+    @blocking_json
+    def resolution(ticket_id: str, request: Request):
         who = principal(request)
         if isinstance(who, JSONResponse):
             return who
-        body = await json_body(request, ResolutionRequest)
+        body = json_body(request, ResolutionRequest)
         accept = body["accept"]
         close = bool(body.get("close"))
         comment = str(body.get("comment") or "").strip()
@@ -717,7 +767,8 @@ def build_app(factory: sessionmaker, creds: Checker, relay: Relay, shard_count: 
                 return JSONResponse({"error": "это действие клиента"}, status_code=403)
             if accept:
                 return JSONResponse({"error": "отзыв закрывает заявку без согласия"}, status_code=400)
-            if not comment or len(comment) > 4000 or not text_allowed(comment):
+            review_text = comment.replace("\r\n", "\n").replace("\n", " ").replace("\t", " ")
+            if not comment or len(comment) > 4000 or not text_allowed(review_text):
                 return JSONResponse({"error": "отзыв пустой, слишком длинный или запрещён правилами"}, status_code=400)
         parsed = _uuid(ticket_id, "id заявки должен быть uuid")
         if isinstance(parsed, JSONResponse):
@@ -733,7 +784,7 @@ def build_app(factory: sessionmaker, creds: Checker, relay: Relay, shard_count: 
                 if denied:
                     return denied
             else:
-                gate = assignee_ticket(session, who, parsed)
+                gate = assignee_ticket(session, who, parsed, request, allow_terminal=True)
                 if isinstance(gate, JSONResponse):
                     return gate
                 shard, _ticket_row = gate
@@ -741,6 +792,8 @@ def build_app(factory: sessionmaker, creds: Checker, relay: Relay, shard_count: 
             closed_now = False
             try:
                 with unit(session):
+                    current = store.lock_ticket(session, shard, found_id)
+                    tunnel_id = current.tunnel_id
                     if close:
                         status = store.close_unresolved(session, shard, found_id, who.role, comment, now)
                     elif who.role == "client" and accept:
@@ -758,10 +811,10 @@ def build_app(factory: sessionmaker, creds: Checker, relay: Relay, shard_count: 
             except Exception as exc:
                 return fail(exc)
         if closed_now:
-            _drop_tunnel(relay, found_id)
+            _try_revoke(factory, relay, tunnel_id)
         return {"status": status}
 
-    async def _participant_write(request: Request, ticket_id: str, writer):
+    def _participant_write(request: Request, ticket_id: str, writer):
         who = principal(request)
         if isinstance(who, JSONResponse):
             return who
@@ -778,15 +831,15 @@ def build_app(factory: sessionmaker, creds: Checker, relay: Relay, shard_count: 
                 if denied:
                     return denied
             else:
-                gate = assignee_ticket(session, who, parsed)
+                gate = assignee_ticket(session, who, parsed, request)
                 if isinstance(gate, JSONResponse):
                     return gate
                 shard, _ticket_row = gate
                 found_id = parsed
-            return await writer(session, shard, found_id, who, request)
+            return writer(session, shard, found_id, who, request)
 
-    async def _message_body(session, shard, found_id, who, request: Request):
-        body = await json_body(request)
+    def _message_body(session, shard, found_id, who, request: Request):
+        body = json_body(request)
         text = str(body.get("body") or "").strip()
         if not text or len(text) > 4000 or not text_allowed(text):
             return JSONResponse({"error": "сообщение пустое, слишком длинное или запрещено правилами"}, status_code=400)
@@ -800,11 +853,16 @@ def build_app(factory: sessionmaker, creds: Checker, relay: Relay, shard_count: 
     return app
 
 
-def _drop_tunnel(relay, ticket_id) -> None:
+def _try_revoke(factory, relay, tunnel_id) -> None:
     try:
-        relay.close(ticket_id)
+        revoke(factory, relay, tunnel_id)
     except Exception as exc:
-        error("relay close", err=str(exc), ticket_id=str(ticket_id))
+        error("relay revoke dispatch", err=str(exc))
+
+
+def _owns_assignment(who: Principal, ticket: Ticket, request: Request) -> bool:
+    expected = request.headers.get("x-support-tunnel")
+    return ticket.assignee == who.operator_id and (not expected or expected == str(ticket.tunnel_id))
 
 
 def _uuid(value: str, message: str):

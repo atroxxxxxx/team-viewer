@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/hex"
+	"errors"
 	"net/http"
 	"time"
 
@@ -32,6 +33,7 @@ func (s *Server) Router() *gin.Engine {
 	api := r.Group("/api/v1", s.requireIngest)
 	api.POST("/tunnels", s.open)
 	api.DELETE("/tunnels/:ticket", s.close)
+	api.POST("/tunnels/:ticket/renew", s.renew)
 	return r
 }
 
@@ -95,12 +97,42 @@ func (s *Server) close(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "ticket должен быть uuid"})
 		return
 	}
-	if err := s.sessions.DeleteByTicket(c.Request.Context(), ticketID.String()); err != nil {
-		logx.Error("redis delete", map[string]any{"err": err.Error()})
+	var closeErr error
+	if raw := c.Query("tunnel_id"); raw != "" {
+		tunnelID, err := uuid.Parse(raw)
+		if err != nil {
+			c.Status(http.StatusBadRequest)
+			return
+		}
+		closeErr = s.sessions.DeleteTunnel(c.Request.Context(), ticketID.String(), tunnelID.String())
+	} else {
+		closeErr = s.sessions.DeleteByTicket(c.Request.Context(), ticketID.String())
+	}
+	if closeErr != nil {
+		logx.Error("redis delete", map[string]any{"err": closeErr.Error()})
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "не удалось закрыть туннель"})
 		return
 	}
 	c.Status(http.StatusNoContent)
+}
+
+func (s *Server) renew(c *gin.Context) {
+	ticketID, ticketErr := uuid.Parse(c.Param("ticket"))
+	tunnelID, tunnelErr := uuid.Parse(c.Query("tunnel_id"))
+	if ticketErr != nil || tunnelErr != nil {
+		c.Status(http.StatusBadRequest)
+		return
+	}
+	err := s.sessions.RenewTunnel(c.Request.Context(), ticketID.String(), tunnelID.String())
+	switch {
+	case errors.Is(err, session.ErrDenied):
+		c.Status(http.StatusNotFound)
+	case err != nil:
+		logx.Error("redis renew", map[string]any{"err": err.Error()})
+		c.Status(http.StatusServiceUnavailable)
+	default:
+		c.Status(http.StatusNoContent)
+	}
 }
 
 func (s *Server) health(c *gin.Context) {

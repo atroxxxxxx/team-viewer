@@ -5,6 +5,8 @@ import (
 	"context"
 	"crypto/sha256"
 	"crypto/subtle"
+	"crypto/tls"
+	"errors"
 	"io"
 	"net"
 	"strings"
@@ -20,15 +22,25 @@ const maxHelloBytes = 200
 type Bridge struct {
 	addr     string
 	rtspAddr string
-	store    *Store
+	store    tunnelLookup
+	peers    *mediaPeers
+	TLS      *tls.Config
+}
+
+type tunnelLookup interface {
+	ByClient(context.Context, string) (Tunnel, error)
+	ByTunnel(context.Context, string) (Tunnel, error)
 }
 
 func NewBridge(addr, rtspAddr string, store *Store) *Bridge {
-	return &Bridge{addr: addr, rtspAddr: rtspAddr, store: store}
+	return &Bridge{addr: addr, rtspAddr: rtspAddr, store: store, peers: &store.peers}
 }
 
 func (b *Bridge) Serve(ctx context.Context) error {
 	ln, err := net.Listen("tcp", b.addr)
+	if err == nil && b.TLS != nil {
+		ln = tls.NewListener(ln, b.TLS)
+	}
 	if err != nil {
 		return err
 	}
@@ -45,31 +57,41 @@ func (b *Bridge) Serve(ctx context.Context) error {
 			logx.Error("session accept", map[string]any{"err": err.Error()})
 			continue
 		}
-		go b.handle(conn)
+		go b.handle(ctx, conn)
 	}
 }
 
-func (b *Bridge) handle(front net.Conn) {
+func (b *Bridge) handle(ctx context.Context, front net.Conn) {
 	defer front.Close()
-	_ = front.SetReadDeadline(time.Now().Add(5 * time.Second))
+	_ = front.SetDeadline(time.Now().Add(5 * time.Second))
 	reader := bufio.NewReaderSize(front, maxHelloBytes)
-	role, clientID, secret, ok := readHello(reader)
+	role, identifier, secret, ok := readHello(reader)
 	if !ok {
 		return
 	}
-	_ = front.SetReadDeadline(time.Time{})
-	item, err := b.store.ByClient(context.Background(), clientID)
+	_ = front.SetDeadline(time.Time{})
+	lookup, cancel := context.WithTimeout(ctx, time.Second)
+	item, err := b.store.ByTunnel(lookup, identifier)
+	if errors.Is(err, ErrDenied) {
+		// Older GUIs send the device UUID rather than the tunnel UUID.
+		item, err = b.store.ByClient(lookup, identifier)
+	}
+	cancel()
 	if err != nil || !item.allows(role, secret) {
 		logx.Info("session denied", map[string]any{"role": role})
 		return
 	}
-	back, err := net.Dial("tcp", b.rtspAddr)
+	back, err := net.DialTimeout("tcp", b.rtspAddr, 3*time.Second)
 	if err != nil {
 		logx.Error("rtsp dial", map[string]any{"err": err.Error()})
 		return
 	}
 	defer back.Close()
-	logx.Info("session joined", map[string]any{"role": role, "client_id": clientID})
+	if b.peers != nil {
+		unbind := b.peers.bind(back.LocalAddr(), item, role)
+		defer unbind()
+	}
+	logx.Info("session joined", map[string]any{"role": role, "tunnel_id": item.TunnelID})
 	done := make(chan struct{}, 2)
 	go func() {
 		// Keep using reader so bytes buffered alongside the hello reach RTSP.
@@ -80,7 +102,23 @@ func (b *Bridge) handle(front net.Conn) {
 		_, _ = io.Copy(front, back)
 		done <- struct{}{}
 	}()
-	<-done
+	ticker := time.NewTicker(time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-done:
+			return
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			check, cancel := context.WithTimeout(ctx, time.Second)
+			_, err := b.store.ByTunnel(check, item.TunnelID)
+			cancel()
+			if err != nil {
+				return
+			}
+		}
+	}
 }
 
 func readHello(reader *bufio.Reader) (role, clientID, secret string, ok bool) {

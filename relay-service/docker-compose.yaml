@@ -19,14 +19,18 @@ services:
     build: .
     restart: unless-stopped
     ports:
-      - "18082:18082"
+      - "${RELAY_INGEST_BIND:-127.0.0.1}:18082:18082"
       - "8554:8554"
+    volumes:
+      - "${RELAY_TLS_DIR:?Set RELAY_TLS_DIR}:/run/relay-tls:ro"
     environment:
       INGEST_ADDR: 0.0.0.0:18082
       SESSION_ADDR: :8554
+      SESSION_TLS_CERT: /run/relay-tls/fullchain.pem
+      SESSION_TLS_KEY: /run/relay-tls/privkey.pem
       RTSP_ADDR: 127.0.0.1:18554
       REDIS_ADDR: redis:6379
-      RELAY_INGEST_TOKEN: ${RELAY_INGEST_TOKEN:-k7R_wQ3nM8pL2vX9cH4sD6fB1aY0uT5e}
+      RELAY_INGEST_TOKEN: ${RELAY_INGEST_TOKEN:?Set RELAY_INGEST_TOKEN}
     depends_on:
       redis:
         condition: service_healthy

@@ -43,8 +43,10 @@ QPushButton#secondary:disabled { color: #6d7b8b; background: #1c2633; border-col
 QCheckBox { color: #c5d1e0; spacing: 9px; background: transparent; }
 QCheckBox::indicator { width: 16px; height: 16px; border: 1px solid #52657c; border-radius: 4px; background: #101823; }
 QCheckBox::indicator:checked { background: #477fe4; border-color: #80abff; }
-QTabWidget::pane { border: 0; background: transparent; top: -1px; }
-QTabBar::tab { color: #9baac0; background: #101927; padding: 10px 15px; margin-right: 5px; border: 1px solid #29394f; border-radius: 9px; }
+QTabWidget, QTabBar { background: transparent; border: 0; }
+QTabWidget::pane { border: 0; background: transparent; }
+QTabWidget::tab-bar { alignment: left; }
+QTabBar::tab { color: #9baac0; background: #101927; padding: 8px 9px; margin-right: 4px; border: 1px solid #29394f; border-radius: 9px; }
 QTabBar::tab:hover { color: #e3edfb; background: #202f45; }
 QTabBar::tab:selected { color: #f2f6ff; background: #2c4268; border: 1px solid #4d70a9; }
 QSplitter::handle { background: transparent; width: 12px; }
@@ -179,6 +181,27 @@ def header(title, on_settings):
     settings.clicked.connect(on_settings)
     row.addWidget(settings, 0)
     return row
+
+
+def sync_chat(widget, messages):
+    text = "\n".join(f"{item.get('author')}: {item.get('body')}" for item in messages)
+    previous = widget.toPlainText()
+    if previous == text:
+        return
+    scroll = widget.verticalScrollBar()
+    position = scroll.value()
+    at_end = position == scroll.maximum()
+    cursor = widget.textCursor()
+    anchor, selection_end = cursor.anchor(), cursor.position()
+    widget.setPlainText(text)
+    if text.startswith(previous) and anchor != selection_end:
+        cursor = widget.textCursor()
+        cursor.setPosition(anchor)
+        cursor.setPosition(selection_end, cursor.KeepAnchor)
+        widget.setTextCursor(cursor)
+        scroll.setValue(position)
+    else:
+        scroll.setValue(scroll.maximum() if at_end else position)
 
 
 def sync_rows(widget, rows):
@@ -393,17 +416,25 @@ def connection_settings(parent):
 def _connection_settings(parent):
     """Записываем только пользовательские параметры, без паролей и токенов."""
     from support_protocol.settings import valid_base, valid_host
-    from PyQt5.QtWidgets import QCheckBox, QDialog, QDialogButtonBox, QFormLayout, QLineEdit, QSpinBox, QVBoxLayout
+    from PyQt5.QtWidgets import QAbstractSpinBox, QDialog, QDialogButtonBox, QFormLayout, QLineEdit, QSpinBox, QVBoxLayout
     dialog = QDialog(parent)
     dialog.setWindowTitle("Настройки подключения")
+    dialog.setMinimumWidth(380)
     layout = QVBoxLayout(dialog)
+    layout.setContentsMargins(20, 20, 20, 20)
+    layout.setSpacing(16)
     form = QFormLayout()
+    form.setFieldGrowthPolicy(QFormLayout.AllNonFixedFieldsGrow)
+    form.setLabelAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+    form.setHorizontalSpacing(16)
+    form.setVerticalSpacing(10)
     address = QLineEdit(parent.api.base)
     host = QLineEdit(parent.relay_host)
     port = QSpinBox()
+    port.setButtonSymbols(QAbstractSpinBox.NoButtons)
     port.setRange(1, 65535)
     port.setValue(parent.relay_port)
-    verify = QCheckBox("Проверять сертификат HTTPS")
+    verify = CheckBox("Проверять сертификат HTTPS")
     verify.setChecked(parent.api.verify)
     form.addRow("Адрес сервиса заявок", address)
     form.addRow("Адрес ретранслятора", host)
@@ -416,14 +447,15 @@ def _connection_settings(parent):
         fps, crf = QLineEdit(), QSpinBox()
         fps.setValidator(QRegularExpressionValidator(QRegularExpression("[1-9][0-9]*"), fps))
         fps.setText(str(parent.settings.get("video_fps", DEFAULT_FPS)))
+        crf.setButtonSymbols(QAbstractSpinBox.NoButtons)
         crf.setRange(18, 35)
         crf.setValue(parent.settings.get("video_crf", 23))
         form.addRow("Кадров в секунду", fps)
-        form.addRow("Качество сжатия, от 18 до 35", crf)
+        form.addRow("Качество сжатия", crf)
     layout.addLayout(form)
     buttons = QDialogButtonBox(QDialogButtonBox.Save | QDialogButtonBox.Cancel)
     buttons.button(QDialogButtonBox.Save).setText("Сохранить")
-    buttons.button(QDialogButtonBox.Cancel).setText("Отмена")
+    secondary(buttons.button(QDialogButtonBox.Cancel)).setText("Отмена")
     buttons.accepted.connect(dialog.accept)
     buttons.rejected.connect(dialog.reject)
     layout.addWidget(buttons)

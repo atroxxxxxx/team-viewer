@@ -103,3 +103,13 @@ class PipelineTests(unittest.TestCase):
                 args = publish_args("rtsp://localhost/stream", "screen", ":0", fps=fps)
                 self.assertEqual(args[args.index("-framerate") + 1], str(fps))
                 self.assertEqual(args[args.index("-g") + 1], str(fps))
+
+
+def test_native_capture_geometry_preserves_aspect_and_maps_pointer():
+    from support_protocol.media import CaptureGeometry
+
+    capture = CaptureGeometry(2560, 1080)
+    assert capture.content_area() == (0, 44, 640, 270)
+    assert capture.project(320, 179) == (1280, 540)
+    assert capture.project(10, 10) is None
+    assert capture.filter() == "scale=640:270,pad=640:360:0:44:black"
