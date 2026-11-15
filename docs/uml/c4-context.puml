@@ -1,0 +1,30 @@
+@startuml c4-context
+title C4. Уровень 1. Контекст системы
+skinparam defaultFontName DejaVu Sans
+skinparam shadowing false
+skinparam roundcorner 12
+skinparam padding 8
+skinparam rectangle {
+  FontColor white
+}
+
+rectangle "Клиент\nчеловек у своего компьютера" as Client #08427B
+rectangle "Оператор\nчеловек или локальная модель" as Operator #08427B
+
+rectangle "Удалённая техподдержка\n<size:12>система: заявка, экран, шаги, ввод</size>" as Support #1168BD
+
+rectangle "Hugging Face\n<size:12>внешняя система, веса моделей</size>" as HF #6B6B6B
+rectangle "Let's Encrypt\n<size:12>внешняя система, сертификат HTTPS</size>" as LE #6B6B6B
+
+Client -right-> Support : описывает проблему,\nпо своему желанию показывает экран\nи отвечает на шаги
+Operator -left-> Support : берёт заявку из очереди\nи ведёт разбор
+Support -down-> HF : первый запуск оператора\nможет скачать веса
+Support -down-> LE : выпуск сертификата,\nесли заданы почта и DNS-имя
+
+legend right
+  Тёмно-синие прямоугольники — люди.
+  Синий — наша система.
+  Серые — внешние системы.
+  Пока сертификата нет, API заявок остаётся на HTTP.
+endlegend
+@enduml

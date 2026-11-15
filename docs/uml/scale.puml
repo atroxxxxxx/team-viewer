@@ -1,0 +1,40 @@
+@startuml scale
+title Рост нагрузки в 10 раз
+skinparam defaultFontName DejaVu Sans
+skinparam shadowing false
+skinparam roundcorner 10
+skinparam rectangle {
+  BackgroundColor #438DD5
+  FontColor white
+}
+skinparam database {
+  BackgroundColor #2E6295
+  FontColor white
+}
+skinparam node {
+  BackgroundColor #FFFFFF
+  BorderColor #1168BD
+}
+
+rectangle "Nginx\nпринимает HTTPS" as Nginx
+
+node "Сервис заявок, 10 экземпляров" {
+  rectangle "заявки 1..10\nбез своего состояния" as Tickets
+}
+
+database "PostgreSQL\n4 узла по секциям\nи реплики чтения" as DB
+rectangle "Ретрансляторы\nпо uuid клиента" as Relay
+database "Redis у каждого\nретранслятора" as Cache
+
+Nginx --> Tickets : опрос сессии\nи запись заявки
+Tickets --> DB : запись в свою секцию,\nчтение очереди с реплики
+Tickets --> Relay : открыть и снять туннель
+Relay --> Cache : секрет и tunnel_id\nна 15 минут
+
+note bottom of DB
+  Номер секции уже считается как crc32(account_id) % 4.
+  В shard_directory есть dsn: секцию можно отсоединить
+  и перенести на другой узел.
+  Кадры в базу не пишутся.
+end note
+@enduml

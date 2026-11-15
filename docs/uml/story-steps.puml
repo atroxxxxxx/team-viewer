@@ -1,0 +1,24 @@
+@startuml story-steps
+title История 2. Управление или план шагов
+skinparam defaultFontName DejaVu Sans
+skinparam sequenceMessageAlign left
+autonumber
+
+actor "Оператор" as Op
+participant "Сервис заявок" as Tickets
+actor "Клиент" as User
+
+Op -> Tickets : POST /control-requests
+Tickets --> User : грант pending в GET /session
+alt Клиент разрешает
+  User -> Tickets : decision allow, scope pointer,key,text
+  Op -> Tickets : POST /input
+  User -> Tickets : result applied или rejected_by_client
+else Клиент не разрешает
+  User -> Tickets : decision allow=false
+  Tickets --> Op : статус guided
+  Op -> Tickets : POST /plans, шаги в порядке отправки
+  User -> Tickets : наблюдение по шагу
+  Op -> Tickets : complete, если наблюдение есть
+end
+@enduml

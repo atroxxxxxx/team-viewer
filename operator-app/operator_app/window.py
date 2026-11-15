@@ -24,7 +24,8 @@ from support_protocol.ui import Background, STYLE, connection_settings, card, he
 from support_protocol.settings import UserSettings
 from support_protocol.api import TicketAPI
 from support_protocol.endpoints import config_file, load_endpoints
-from support_protocol.media import FRAME_HEIGHT, FRAME_WIDTH, play_args, should_open_player, latest_frame
+from support_protocol.labels import step_line, ticket_status
+from support_protocol.media import FRAME_HEIGHT, FRAME_WIDTH, latest_frame, play_args, session_ended, should_open_player
 from support_protocol.policy import intent_allowed, validate_input, validate_step
 from support_protocol.tunnel import LocalRTSPBridge
 
@@ -52,6 +53,7 @@ class OperatorWindow(QWidget, Background):
         self.playing_tunnel = ""
         self.play_gen = 0
         self.bridge: LocalRTSPBridge | None = None
+        self.media_secret = ""
         self.session: dict = {}
         self.player: QProcess | None = None
         self.buffer = bytearray()
@@ -78,6 +80,8 @@ class OperatorWindow(QWidget, Background):
         self.queue_timer.start()
         self._queue_polling = False
         self._queue_snapshot = None
+        self._status_until = 0.0
+        self._releasing = False
         self.reload_queue()
 
     def _build(self) -> None:
@@ -194,7 +198,7 @@ class OperatorWindow(QWidget, Background):
         desktop_layout.addWidget(label("УДАЛЁННОЕ УСТРОЙСТВО", "eyebrow"))
         video_heading = QHBoxLayout()
         video_heading.addWidget(label("Экран клиента", "cardTitle"), 1)
-        self.video_rate = label("— FPS", "muted")
+        self.video_rate = label("— кадр/с", "muted")
         video_heading.addWidget(self.video_rate)
         desktop_layout.addLayout(video_heading)
         viewport, viewport_layout = card("viewport", 12, 0)
@@ -256,11 +260,17 @@ class OperatorWindow(QWidget, Background):
         def done(tickets):
             self._queue_polling = False
             self.service_recovered()
-            snapshot = [(str(t.get("ticket_id", "")), str(t.get("description", ""))) for t in tickets]
+            snapshot = [
+                (str(t.get("ticket_id", "")), str(t.get("description", "")), str(t.get("handoff") or ""))
+                for t in tickets
+            ]
             if snapshot != self._queue_snapshot:
-                sync_rows(self.queue, [(ticket_id, f"{ticket_id} {description[:80]}") for ticket_id, description in snapshot])
+                sync_rows(self.queue, [
+                    (ticket_id, f"{ticket_id} {description[:80]}" + (f" — {handoff}" if handoff else ""))
+                    for ticket_id, description, handoff in snapshot
+                ])
                 self._queue_snapshot = snapshot
-            if not self.ticket_id:
+            if not self.ticket_id and time.monotonic() >= self._status_until:
                 self.status.setText(f"Заявок в очереди: {len(tickets)}" if tickets else "Очередь пуста")
         def failed(error):
             self._queue_polling = False
@@ -272,10 +282,10 @@ class OperatorWindow(QWidget, Background):
             return
         item = self.queue.currentItem()
         if item is None:
-            self.status.setText("Выберите заявку")
+            self._note("Выберите заявку")
             return
         if self.ticket_id:
-            self.status.setText("Сначала завершите текущую заявку")
+            self._note("Сначала завершите текущую заявку")
             return
         ticket_id = item.text().split()[0]
         self._claiming = True
@@ -283,8 +293,9 @@ class OperatorWindow(QWidget, Background):
         def done(claimed):
             self._claiming = False
             self.ticket_id = ticket_id
+            self._note(f"Заявка {ticket_id} захвачена")
+            self.media_secret = str(claimed.get("media_secret") or "")
             self._update_actions()
-            self.status.setText(f"Заявка {ticket_id} захвачена")
             self._sync_player(claimed["account_id"], claimed["tunnel_id"], "assigned")
         def failed(error):
             self._claiming = False
@@ -292,11 +303,11 @@ class OperatorWindow(QWidget, Background):
             self.report_error(error)
         self.run_background(lambda: self.api.claim(ticket_id), done, failed)
     def _sync_player(self, account_id: str, tunnel_id: str, status: str) -> None:
-        if status in {"resolved", "closed"} or not tunnel_id:
+        if session_ended(status) or not tunnel_id:
             self._stop_play()
             return
         running = self.player is not None and self.player.state() != QProcess.NotRunning
-        if account_id and should_open_player(self.playing_tunnel, tunnel_id, running, status):
+        if account_id and len(self.media_secret) == 64 and should_open_player(self.playing_tunnel, tunnel_id, running, status):
             self._play(account_id, tunnel_id)
 
     def _stop_play(self) -> None:
@@ -309,7 +320,7 @@ class OperatorWindow(QWidget, Background):
         self._pending_frame = None
         self.render_timer.stop()
         self._frame_times.clear()
-        self.video_rate.setText("— FPS")
+        self.video_rate.setText("— кадр/с")
         self.frame = None
         self.buffer.clear()
         self.preview.clear()
@@ -321,13 +332,13 @@ class OperatorWindow(QWidget, Background):
         self._stop_play()
         gen = self.play_gen
         self.playing_tunnel = tunnel_id
-        self.bridge = LocalRTSPBridge(self.relay_host, self.relay_port, "OPERATOR", account_id)
+        self.bridge = LocalRTSPBridge(self.relay_host, self.relay_port, "OPERATOR", account_id, self.media_secret)
         url = self.bridge.url(f"/tunnels/{tunnel_id}/screen")
         try:
             args = play_args(url)
         except RuntimeError as exc:
             self._stop_play()
-            self.status.setText(str(exc))
+            self._note(str(exc))
             return
         self.buffer.clear()
         self._player_stderr = ""
@@ -361,7 +372,7 @@ class OperatorWindow(QWidget, Background):
         self._pending_frame = None
         self.render_timer.stop()
         self._frame_times.clear()
-        self.video_rate.setText("— FPS")
+        self.video_rate.setText("— кадр/с")
         self.preview.clear()
         self.preview.setText("Поток прерван. Повторное подключение...")
 
@@ -394,11 +405,11 @@ class OperatorWindow(QWidget, Background):
 
     def _update_video_rate(self):
         if len(self._frame_times) < 2 or time.monotonic() - self._frame_times[-1] > 2:
-            self.video_rate.setText("— FPS")
+            self.video_rate.setText("— кадр/с")
             return
         elapsed = self._frame_times[-1] - self._frame_times[0]
         fps = (len(self._frame_times) - 1) / elapsed if elapsed > 0 else 0
-        self.video_rate.setText(f"{fps:.0f} FPS")
+        self.video_rate.setText(f"{fps:.0f} кадр/с")
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
@@ -423,21 +434,33 @@ class OperatorWindow(QWidget, Background):
     def _show_session(self) -> None:
         ticket = self.session.get("ticket") or {}
         status = ticket.get("status") or ""
-        if status in {"resolved", "closed"}:
-            self._finish_ticket(status)
+        if (status == "queued" and self.ticket_id) or self.session.get("owned") is False:
+            self._finish_ticket(returned=True)
             return
+        if session_ended(status):
+            self._finish_ticket()
+            return
+        self.media_secret = str(self.session.get("media_secret") or "")
         self._sync_player(ticket.get("account_id") or "", ticket.get("tunnel_id") or "", status)
-        self.status.setText(f"{status} · {self.ticket_id}")
+        if time.monotonic() >= self._status_until:
+            notice = str((self.session.get("handoff") or {}).get("operator") or "")
+            self.status.setText(notice or ticket_status(status, self.ticket_id))
         sync_chat(self.chat, self.session.get("messages") or [])
-        sync_rows(self.steps, [(str(step.get("id", "")), f"{step.get('status')} {step.get('id')} {step.get('body')}")
-                               for step in self.session.get("steps") or []])
+        sync_rows(self.steps, [(str(step.get("id", "")), step_line(step)) for step in self.session.get("steps") or []])
         self._update_actions()
-    def _finish_ticket(self, status):
+
+    def _finish_ticket(self, *, returned=False):
         self._stop_play()
         self.ticket_id = ""
+        self.media_secret = ""
         self.session = {}
-        self.preview.setText("Сеанс завершён")
-        self.status.setText("Заявка закрыта без решения" if status == "closed" else "Заявка завершена")
+        if returned:
+            self.preview.setText("Экран появится после захвата")
+            self._note("Заявка вернулась в очередь")
+        else:
+            self.preview.setText("Сеанс завершён")
+            self._status_until = 0.0
+            self.status.setText("Заявка завершена")
         self._update_actions()
         self.reload_queue()
 
@@ -472,7 +495,7 @@ class OperatorWindow(QWidget, Background):
         self.run_background(lambda: self.api.post_input(ticket_id, event))
 
     def _blocked(self, intent: str, detail: str) -> None:
-        self.status.setText(detail)
+        self._note(detail)
         ticket_id = self.ticket_id
         if ticket_id:
             self.run_background(lambda: self.api.log_blocked(ticket_id, intent or "unknown", detail), failed=self.report_error)
@@ -507,7 +530,7 @@ class OperatorWindow(QWidget, Background):
         step_id = _selected_id(self.steps)
         steps = [line.strip() for line in self.plan_text.toPlainText().splitlines() if line.strip()]
         if not step_id or not steps:
-            self.status.setText("Нужны выбранный шаг и строки нового плана")
+            self._note("Нужны выбранный шаг и строки нового плана")
             return
         description = self.problem.text().strip()
         self._guarded(lambda ticket_id: self.api.add_problem(ticket_id, step_id, description, steps))
@@ -541,14 +564,14 @@ class OperatorWindow(QWidget, Background):
         models = self.models
         ticket_id = self.ticket_id
         self.model_button.setEnabled(False)
-        self.status.setText("Модель обрабатывает заявку...")
+        self._note("Модель обрабатывает заявку...")
         def done(action):
             self._update_actions()
             if self.ticket_id == ticket_id:
                 self._apply_model(action)
         def failed(error):
             self._update_actions()
-            self.status.setText(f"Модель недоступна: {error}")
+            self._note(f"Модель недоступна: {error}")
         ModelProcess(self, "action", {"models": models, "context": context,
                                       "frame": base64.b64encode(png).decode("ascii") if png else None}, done, failed)
 
@@ -585,13 +608,13 @@ class OperatorWindow(QWidget, Background):
             self.resolve(True)
         elif kind == "input":
             if not self.allow_model_input.isChecked():
-                self.status.setText("Модель предложила ввод. Переключатель выключен, событие не отправлено.")
+                self._note("Модель предложила ввод. Переключатель выключен, событие не отправлено.")
                 return
             event = action.get("input") or {}
             event["intent"] = intent
             self._send_input(event)
         else:
-            self.status.setText("Модель ждёт")
+            self._note("Модель ждёт")
 
     def _png(self) -> bytes | None:
         if self.frame is None:
@@ -608,16 +631,49 @@ class OperatorWindow(QWidget, Background):
                 if self.ticket_id == ticket_id:
                     return call(ticket_id)
             self.run_background(execute, done)
+    def _note(self, text: str) -> None:
+        self._status_until = time.monotonic() + 5
+        self.status.setText(text)
+
+    def report_error(self, error) -> None:
+        super().report_error(error)
+        self._status_until = time.monotonic() + 5
+
+    def service_recovered(self) -> None:
+        failed = self._service_failed
+        super().service_recovered()
+        if failed:
+            self._status_until = time.monotonic() + 5
+
     def closeEvent(self, event) -> None:
-        self.close_background()
+        if self._releasing:
+            event.ignore()
+            return
+        ticket_id, self.ticket_id = self.ticket_id, ""
         for job in list(self._model_jobs):
             job.kill()
         self._model_jobs.clear()
         self.timer.stop()
         self.queue_timer.stop()
-        self.render_timer.stop()
         self._stop_play()
-        super().closeEvent(event)
+        if not ticket_id:
+            self.close_background()
+            super().closeEvent(event)
+            return
+        event.ignore()
+        self._releasing = True
+        self.setEnabled(False)
+        self._note("Возвращаю заявку в очередь…")
+
+        def finish(_):
+            self._releasing = False
+            self.close()
+
+        def failed(error):
+            log.warning("Could not release ticket on close", exc_info=(type(error), error, error.__traceback__))
+            finish(None)
+
+        self.run_background(lambda: self.api.release(ticket_id), finish, failed)
 
 
 def _load_id(path: Path) -> str:
@@ -633,5 +689,4 @@ def _selected_id(widget: QListWidget) -> str:
     item = widget.currentItem()
     if item is None:
         return ""
-    parts = item.text().split()
-    return parts[1] if len(parts) > 1 else ""
+    return str(item.data(Qt.UserRole) or "")

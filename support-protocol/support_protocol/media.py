@@ -1,4 +1,7 @@
+import re
 import shutil
+
+_DISPLAY = re.compile(r"^:[0-9]{1,2}(?:\.[0-9]{1,2})?$")
 
 FRAME_WIDTH = 640
 FRAME_HEIGHT = 360
@@ -30,7 +33,7 @@ def publish_args(url: str, mode: str, display: str, *, fps: int = DEFAULT_FPS, c
     if mode == "screen":
         return [
             ffmpeg, "-loglevel", "error", "-f", "x11grab", "-framerate", str(fps),
-            "-video_size", "1280x720", "-i", display,
+            "-video_size", "1280x720", "-i", display if _DISPLAY.fullmatch(display or "") else ":0",
             "-vf", f"scale={FRAME_WIDTH}:{FRAME_HEIGHT}", *output,
         ]
     if mode == "camera":
@@ -68,9 +71,13 @@ def latest_frame(buffer: bytearray, chunk: bytes, frame_size: int) -> bytes | No
     return raw
 
 
+def session_ended(status: str) -> bool:
+    return status in {"resolved", "closed"}
+
+
 def media_action(active_tunnel: str, wanted_tunnel: str, status: str) -> str:
     """Что сделать с публикацией клиента: stop, start, keep или idle."""
-    if status in {"resolved", "closed"}:
+    if session_ended(status):
         return "stop" if active_tunnel else "idle"
     if wanted_tunnel and wanted_tunnel != active_tunnel:
         return "start"
@@ -83,7 +90,7 @@ def media_action(active_tunnel: str, wanted_tunnel: str, status: str) -> str:
 
 def should_open_player(playing_tunnel: str, wanted_tunnel: str, running: bool, status: str) -> bool:
     """Оператор открывает плеер, пока заявка жива, а поток ещё не идёт."""
-    if status in {"resolved", "closed"} or not wanted_tunnel:
+    if session_ended(status) or not wanted_tunnel:
         return False
     if playing_tunnel != wanted_tunnel:
         return True

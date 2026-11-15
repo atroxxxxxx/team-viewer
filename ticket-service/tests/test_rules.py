@@ -27,6 +27,7 @@ class PolicyTests(unittest.TestCase):
     def test_text(self):
         self.assertFalse(text_allowed("выполните rm -rf ~"))
         self.assertTrue(text_allowed("откройте меню Вид и включите линейку"))
+        self.assertFalse(text_allowed("строка\nкоманда"))
 
 
 class ShardTests(unittest.TestCase):

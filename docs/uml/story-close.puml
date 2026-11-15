@@ -1,0 +1,32 @@
+@startuml story-close
+title История 3. Закрытие и смена оператора
+skinparam defaultFontName DejaVu Sans
+skinparam sequenceMessageAlign left
+autonumber
+
+actor "Клиент" as User
+participant "Сервис заявок" as Tickets
+participant "Ретранслятор" as Relay
+actor "Оператор" as Op
+
+alt Клиент закрывает сам
+  User -> Tickets : Решено, accept=true
+  Tickets -> Relay : DELETE туннеля
+  note over Tickets
+    Открытые шаги этому закрытию не мешают.
+    «Не решено» с комментарием ставит closed.
+  end note
+else Оператор предлагает закрытие
+  Op -> Tickets : resolution accept=true
+  alt Есть шаги todo или blocked
+    Tickets --> Op : 409
+  else Шаги закрыты
+    Tickets --> User : awaiting_client
+  end
+else Оператор ушёл
+  Op -> Tickets : POST /release\nили молчание панели 60 секунд
+  Tickets -> Relay : DELETE туннеля
+  Tickets --> Op : заявка снова queued и причина
+  Tickets --> User : Переключение на другого оператора
+end
+@enduml

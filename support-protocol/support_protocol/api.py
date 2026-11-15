@@ -91,12 +91,14 @@ class TicketAPI:
             {"parent_step_id": parent_step_id, "description": description, "steps": steps},
         )
 
-    def resolve(self, ticket_id: str, role: str, accept: bool, comment: str = "", *, close: bool = False) -> dict:
-        return self._json(
-            "POST",
-            f"/api/v1/tickets/{ticket_id}/resolution",
-            {"role": role, "accept": accept, "comment": comment, **({"close": True} if close else {})},
-        )
+    def release(self, ticket_id: str) -> dict:
+        return self._json("POST", f"/api/v1/tickets/{ticket_id}/release", {}, timeout=3)
+
+    def resolve(self, ticket_id: str, role: str, accept: bool, comment: str = "", close: bool = False) -> dict:
+        body = {"role": role, "accept": accept, "comment": comment}
+        if close:
+            body["close"] = True
+        return self._json("POST", f"/api/v1/tickets/{ticket_id}/resolution", body)
 
     def health(self):
         return self._json("GET", "/health")
@@ -110,7 +112,7 @@ class TicketAPI:
                 log.error("Ticket service request failed", exc_info=(type(error), error, error.__traceback__))
                 self._last_error, self._last_error_at = key, now
 
-    def _json(self, method: str, path: str, body: dict | None = None) -> dict:
+    def _json(self, method: str, path: str, body: dict | None = None, timeout: float | None = None) -> dict:
         headers = {}
         if self.ticket_token:
             headers["X-Ticket-Token"] = self.ticket_token
@@ -120,7 +122,7 @@ class TicketAPI:
                 # Принятие и закрытие заявки включают запрос к relay (до 5 с).
                 # Сохраняем прежний бюджет POST, иначе сервер может уже изменить
                 # заявку после того, как GUI перестал ждать результат.
-                headers=headers, timeout=httpx.Timeout(3.0, connect=1.5, read=15.0 if method == "POST" else 3.0),
+                headers=headers, timeout=httpx.Timeout(3.0, connect=1.5, read=timeout or (15.0 if method == "POST" else 3.0)),
                 verify=self.verify,
             )
             response.raise_for_status()

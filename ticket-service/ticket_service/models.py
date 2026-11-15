@@ -1,7 +1,7 @@
 import uuid
 from datetime import datetime, timezone
 
-from sqlalchemy import Boolean, DateTime, SmallInteger, Text
+from sqlalchemy import Boolean, DateTime, Integer, SmallInteger, Text
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
@@ -34,6 +34,8 @@ class Ticket(Base):
     assignee: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
     token_hash: Mapped[str] = mapped_column(Text)
     tunnel_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
+    client_media_secret: Mapped[str | None] = mapped_column(Text)
+    operator_media_secret: Mapped[str | None] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
 
 
@@ -74,6 +76,7 @@ class PlanStep(Base):
     ticket_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True))
     body: Mapped[str] = mapped_column(Text)
     status: Mapped[str] = mapped_column(Text)
+    position: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
 
 
 class Observation(Base):
@@ -83,6 +86,7 @@ class Observation(Base):
     step_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True))
     ticket_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True))
     body: Mapped[str] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
 
 
 class ControlGrant(Base):

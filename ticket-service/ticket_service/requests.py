@@ -12,6 +12,7 @@ class ControlDecision(BaseModel):
 class ResolutionRequest(BaseModel):
     accept: StrictBool
     close: StrictBool = False
+    comment: str = ""
 
 
 class CompleteStepRequest(BaseModel):

@@ -40,13 +40,18 @@ def intent_allowed(intent: str) -> bool:
 
 
 def text_allowed(text: str) -> bool:
+    if any(ord(ch) < 32 or ord(ch) == 127 for ch in (text or "")):
+        return False
     folded = (text or "").lower()
     return not any(item in folded for item in FORBIDDEN_TEXT)
 
 
 def key_allowed(key: dict | None) -> bool:
     key = key or {}
-    code = str(key.get("code", "")).lower()
+    raw = str(key.get("code", ""))
+    if not raw or len(raw) > 32 or not raw.isascii() or not all(ch.isalnum() or ch == "_" for ch in raw):
+        return False
+    code = raw.lower()
     modifiers = {str(item).lower() for item in key.get("modifiers") or []}
     if code in {"delete", "kp_delete"} and "shift" in modifiers:
         return False

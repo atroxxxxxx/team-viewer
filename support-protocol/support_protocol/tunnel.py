@@ -11,10 +11,12 @@ log = logging.getLogger(__name__)
 class LocalRTSPBridge:
     """Передаёт локальный RTSP в сессионный порт ретранслятора."""
 
-    def __init__(self, relay_host: str, relay_port: int, role: str, client_id: str):
+    def __init__(self, relay_host: str, relay_port: int, role: str, client_id: str, secret: str):
         self.relay_host = relay_host
         self.relay_port = int(relay_port)
-        self.hello = f"{role} {client_id}\n".encode()
+        if len(secret) != 64:
+            raise ValueError("нет секрета сессии")
+        self.hello = f"{role} {client_id} {secret}\n".encode()
         try:
             loopback = ipaddress.ip_address(relay_host).is_loopback
         except ValueError:

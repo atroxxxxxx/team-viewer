@@ -10,6 +10,7 @@ from fastapi.testclient import TestClient
 from sqlalchemy import func, select, text
 
 from ticket_service.app import build_app
+from ticket_service.relay import OpenedTunnel
 from ticket_service.auth import Checker
 from ticket_service.models import ActionLog, Confirmation, ControlGrant, Observation, Ticket
 
@@ -38,7 +39,7 @@ class RelayStub:
             raise ConnectionError("test relay unavailable")
         tunnel = uuid.uuid4()
         self.tunnels[ticket_id] = tunnel
-        return tunnel
+        return OpenedTunnel(tunnel, "c" * 64, "o" * 64)
 
     def close(self, ticket_id):
         self.closes.append(ticket_id)
@@ -96,6 +97,20 @@ def api(factory):
     app = build_app(factory, Checker(*CLIENT, *OPERATOR), relay, 4, "/openapi/tickets.json")
     with TestClient(app) as http:
         yield API(http, relay)
+
+
+def test_media_secret_is_role_specific_and_queue_hides_account(api):
+    queued = api.http.get("/api/v1/tickets", auth=OPERATOR)
+    assert queued.status_code == 200, queued.text
+    row = queued.json()["tickets"][0]
+    assert "account_id" not in row and "tunnel_id" not in row and "media_secret" not in row
+    claimed = api.claim()
+    assert claimed["media_secret"] == "o" * 64
+    assert api.session()["media_secret"] == "c" * 64
+    operator = api.http.get(api.path + "/session", auth=OPERATOR)
+    assert operator.status_code == 200, operator.text
+    assert operator.json()["media_secret"] == "o" * 64
+    assert "client_secret" not in operator.json()
 
 
 def test_repeat_claim_preserves_existing_tunnel(api):
@@ -223,8 +238,78 @@ def test_input_result_and_observation_work_before_resolution(api):
     assert api.operator("/plans", {"steps": ["Проверить меню"]}).status_code == 201
     step = api.session()["steps"][0]["id"]
     assert api.client(f"/steps/{step}/observations", {"body": "Меню открыто"}).status_code == 201
+    notes = api.session()["steps"][0]["observations"]
+    assert [item["body"] for item in notes] == ["Меню открыто"]
+    assert api.session()["messages"][-1]["body"] == "По шагу «Проверить меню»: Меню открыто"
     assert api.operator(f"/steps/{step}/complete", {}).status_code == 200
     assert api.session()["steps"][0]["status"] == "done"
+
+
+def test_client_accept_closes_even_with_open_steps(api):
+    api.claim()
+    assert api.operator("/plans", {"steps": ["Открыть меню"]}).status_code == 201
+    response = api.client("/resolution", {"accept": True})
+    assert response.status_code == 200
+    assert response.json()["status"] == "resolved"
+    assert api.session()["ticket"]["status"] == "resolved"
+    assert api.relay.closes == [uuid.UUID(api.id)]
+
+
+def test_plan_steps_keep_submission_order(api):
+    api.claim()
+    steps = ["Яблоко", "Арбуз", "Банан"]
+    assert api.operator("/plans", {"steps": steps}).status_code == 201
+    assert [item["body"] for item in api.session()["steps"]] == steps
+
+
+def test_awaiting_client_closes_after_one_minute(api, factory):
+    api.claim()
+    assert api.operator("/resolution", {"accept": True}).json()["status"] == "awaiting_client"
+    stale = datetime.now(timezone.utc) - timedelta(seconds=61)
+    with factory.begin() as session:
+        session.execute(text("UPDATE confirmations SET created_at = :stale"), {"stale": stale})
+    assert api.session()["ticket"]["status"] == "closed"
+    assert api.relay.closes == [uuid.UUID(api.id)]
+
+
+def test_silent_client_closes_ticket(api, factory):
+    api.claim()
+    api.session()
+    stale = datetime.now(timezone.utc) - timedelta(seconds=61)
+    with factory.begin() as session:
+        session.execute(
+            text("UPDATE action_log SET created_at = :stale WHERE intent = 'client_presence'"),
+            {"stale": stale},
+        )
+    response = api.http.get(api.path + "/session", auth=OPERATOR)
+    assert response.status_code == 200, response.text
+    assert response.json()["ticket"]["status"] == "closed"
+    assert api.relay.closes == [uuid.UUID(api.id)]
+
+
+def test_client_review_closes_ticket_without_operator(api):
+    api.claim()
+    assert api.operator("/plans", {"steps": ["Открыть меню"]}).status_code == 201
+    review = "Что не получилось: меню не открылось\nПочему: пункта нет"
+    response = api.client("/resolution", {"accept": False, "close": True, "comment": review})
+    assert response.status_code == 200
+    assert response.json()["status"] == "closed"
+    session = api.session()
+    assert session["ticket"]["status"] == "closed"
+    assert session["messages"][0]["author"] == "client"
+    assert session["messages"][0]["body"] == review
+    assert session["confirmations"][0]["accept"] is False
+    assert api.relay.closes == [uuid.UUID(api.id)]
+    assert api.client("/messages", {"body": "ещё"}).status_code == 409
+
+
+def test_unresolved_review_is_required_and_client_only(api):
+    api.claim()
+    assert api.client("/resolution", {"accept": False, "close": True}).status_code == 400
+    assert api.session()["ticket"]["status"] == "assigned"
+    assert api.operator("/resolution", {"accept": False, "close": True, "comment": "отзыв"}).status_code == 403
+    assert api.client("/resolution", {"accept": False}).json()["status"] == "guided"
+    assert api.relay.closes == []
 
 
 def test_expired_grant_rejects_new_input(api, factory):
@@ -290,7 +375,9 @@ def test_resolved_ticket_rejects_further_changes(resolved, operation):
         "reject": lambda: api.client("/resolution", {"accept": False, "comment": "test"}),
         "accept": lambda: api.operator("/resolution", {"accept": True}),
     }
-    assert calls[operation]().status_code == 409
+    # Повторное подтверждение уже закрытой заявки не меняет её и отдаёт текущий статус.
+    expected = 200 if operation in {"reject", "accept"} else 409
+    assert calls[operation]().status_code == expected
     snapshot = api.session()
     assert snapshot["ticket"]["status"] == "resolved"
     assert snapshot["messages"] == []
@@ -318,7 +405,7 @@ def test_concurrent_confirmations_close_once(api):
     assert len(api.relay.closes) == 1
 
 
-def test_close_without_solution_accepts_multiline_feedback_and_revokes_session(api):
+def test_close_without_solution_accepts_multiline_feedback_and_revokes_session(api, factory):
     api.claim()
     api.allow_control()
     reason = "Проблема осталась\nСбой повторяется"
@@ -329,6 +416,11 @@ def test_close_without_solution_accepts_multiline_feedback_and_revokes_session(a
     snapshot = api.session()
     assert snapshot["control"] == {}
     assert snapshot["messages"][-1]["body"] == reason
+    assert "media_secret" not in snapshot
+    with factory() as session:
+        ticket = session.scalar(select(Ticket).where(Ticket.id == uuid.UUID(api.id)))
+        assert ticket.client_media_secret is None and ticket.operator_media_secret is None
+        assert session.scalar(select(ActionLog).where(ActionLog.intent == "tunnel_access")) is None
     assert api.client("/messages", {"body": "после закрытия"}).status_code == 409
 
 
@@ -342,3 +434,24 @@ def test_session_can_omit_unchanged_chat_history(api):
     assert [msg["body"] for msg in snapshot(0)["messages"]] == ["один"]
     assert "messages" not in snapshot(1)
     assert "messages" in api.session()
+
+def test_migrate_legacy_media_secrets_without_losing_active_session(api, factory):
+    from ticket_service.db import ensure_tunnel_access
+
+    claimed = api.claim()
+    with factory.begin() as session:
+        ticket = session.get(Ticket, (claimed["shard_id"], uuid.UUID(api.id)))
+        ticket.client_media_secret = ticket.operator_media_secret = None
+        log_id = uuid.uuid4()
+        session.add(ActionLog(
+            id=log_id, shard_id=ticket.shard_id, ticket_id=ticket.id, actor="service",
+            intent="tunnel_access", phase="applied",
+            detail={"client_secret": "c" * 64, "operator_secret": "o" * 64, "note": "keep"},
+        ))
+
+    ensure_tunnel_access(factory)
+    ensure_tunnel_access(factory)
+    assert api.session()["media_secret"] == "c" * 64
+    with factory() as session:
+        entry = session.get(ActionLog, (claimed["shard_id"], log_id))
+        assert entry.detail == {"note": "keep"}

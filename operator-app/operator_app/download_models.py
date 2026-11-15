@@ -79,9 +79,10 @@ def _ready(dest: Path, manifest: dict, profile: Profile) -> bool:
 def _files_ok(dest: Path, parts: list[str], role: Role) -> bool:
     if len(parts) != len(role.files):
         return False
+    root = dest.resolve()
     for relative in parts:
-        path = dest / relative
-        if not path.is_file() or path.stat().st_size < 1024:
+        path = (dest / relative).resolve()
+        if not path.is_relative_to(root) or not path.is_file() or path.stat().st_size < 1024:
             return False
     return True
 

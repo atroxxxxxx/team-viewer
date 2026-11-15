@@ -27,6 +27,11 @@ class PolicyTest(unittest.TestCase):
 
     def test_text_denylist(self):
         self.assertFalse(text_allowed("sudo passwd root"))
+        self.assertFalse(text_allowed("строка\nкоманда"))
+
+    def test_key_code_must_be_plain(self):
+        event = {"type": "key", "intent": "adjust_app_setting", "key": {"code": "a;b", "modifiers": [], "action": "press"}}
+        self.assertIsNotNone(validate_input(event, GRANT, 640, 360))
 
 
 if __name__ == "__main__":

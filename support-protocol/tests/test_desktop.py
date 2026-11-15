@@ -36,6 +36,7 @@ def windows(app, monkeypatch, tmp_path):
     monkeypatch.setattr(operator_module, "STATE", tmp_path / "operator-id")
     monkeypatch.setattr(TicketAPI, "health", lambda self: {"status": "ok"})
     monkeypatch.setattr(TicketAPI, "list_queued", lambda self: [])
+    monkeypatch.setattr(TicketAPI, "release", lambda self, ticket_id: {})
     c, o = client_module.ClientWindow(), operator_module.OperatorWindow()
     pump(app, lambda: not o._tasks)
     yield c, o
@@ -278,7 +279,6 @@ def test_queued_input_rechecks_session_and_permission(app, windows, end_session)
 
 
 def test_ending_session_inside_confirmation_cancels_input(app, windows, monkeypatch):
-    from PyQt5.QtWidgets import QMessageBox
     c, _ = windows
     _grant(c)
     c.dangerous.setChecked(True)
@@ -286,8 +286,8 @@ def test_ending_session_inside_confirmation_cancels_input(app, windows, monkeypa
     c._inject = lambda *_: calls.append("bad")
     def confirm(*_):
         c._show_session({"ticket": {"status": "resolved"}})
-        return QMessageBox.Yes
-    monkeypatch.setattr(QMessageBox, "question", confirm)
+        return True
+    monkeypatch.setattr(client_module, "ask_yes_no", confirm)
     c._apply_input("confirm", {"detail": {"type": "text", "intent": "type_in_field", "text": "hello"}})
     assert not calls and not c._input_busy
 
@@ -305,7 +305,10 @@ def test_old_send_result_does_not_erase_new_draft(app, windows, role, field):
     editor = getattr(window, field)
     editor.setText("first")
     if field == "observation":
-        window.steps.addItem("pending step body")
+        from PyQt5.QtWidgets import QListWidgetItem
+        item = QListWidgetItem("Нужно сделать: шаг")
+        item.setData(Qt.UserRole, "step-1")
+        window.steps.addItem(item)
         window.steps.setCurrentRow(0)
         window.send_observation()
     else:
@@ -340,6 +343,95 @@ def test_step_selection_and_scroll_survive_session_updates(app, windows, role):
     update()
     assert w.steps.currentItem() is selected
     assert w.steps.verticalScrollBar().value() == scroll
+
+
+def test_operator_notice_is_not_replaced_by_guided_status(app, windows):
+    _, o = windows
+    o.ticket_id = "ticket"
+    o._note("Нет разрешения на это действие.")
+    o.session = {"ticket": {"status": "guided"}, "steps": [{"id": "step-1", "status": "todo", "body": "Открыть меню", "observations": [{"body": "Меню открыто"}]}]}
+    o._show_session()
+    assert o.status.text() == "Нет разрешения на это действие."
+    assert o.steps.item(0).text() == "Нужно сделать: Открыть меню — ответ клиента: Меню открыто"
+    o._status_until = time.monotonic() - 1
+    o._show_session()
+    assert o.status.text() == "работа по плану · ticket"
+
+
+def test_closed_ticket_ends_operator_session(app, windows):
+    _, o = windows
+    o.reload_queue = lambda: None
+    o.ticket_id = "ticket"
+    o._note("ошибка")
+    o.session = {"ticket": {"status": "closed"}}
+    o._show_session()
+    assert o.ticket_id == ""
+    assert o.status.text() == "Заявка завершена"
+
+
+def test_client_sees_switch_when_operator_leaves(app, windows):
+    c, _ = windows
+    c.ticket_id = "ticket"
+    c._show_session({
+        "ticket": {"status": "queued"},
+        "handoff": {"client": "Переключение на другого оператора"},
+    })
+    assert c.ticket_id == "ticket"
+    assert c.status.text() == "Переключение на другого оператора"
+
+
+def test_operator_drops_ticket_returned_to_queue(app, windows):
+    _, o = windows
+    o.ticket_id = "ticket"
+    o.reload_queue = lambda: None
+    o.session = {"ticket": {"status": "queued"}, "owned": False}
+    o._show_session()
+    assert o.ticket_id == ""
+    assert o.status.text() == "Заявка вернулась в очередь"
+
+
+def test_closing_operator_releases_open_ticket(app, windows):
+    _, o = windows
+    sent = []
+    released = threading.Event()
+    o.ticket_id = "ticket"
+
+    def release(ticket_id):
+        sent.append(ticket_id)
+        assert released.wait(2)
+        return {}
+
+    o.api.release = release
+    o.show()
+    try:
+        assert not o.close()
+        pump(app, lambda: bool(sent))
+        assert sent == ["ticket"] and o.isVisible() and o._releasing
+    finally:
+        released.set()
+    pump(app, lambda: not o.isVisible() and o._closing)
+
+
+def test_unresolved_button_sends_review(app, windows, monkeypatch):
+    c, _ = windows
+    c.ticket_id = "ticket"
+    sent = []
+    c.api.resolve = lambda *args, **kwargs: sent.append((args, kwargs)) or {}
+    monkeypatch.setattr(c, "_ask_unresolved", lambda: "Что не получилось: экран\nПочему: нет кнопки")
+    c.resolve(False)
+    pump(app, lambda: bool(sent))
+    assert sent == [(("ticket", "client", False, "Что не получилось: экран\nПочему: нет кнопки"), {"close": True})]
+
+
+def test_unresolved_cancel_does_not_call_api(app, windows, monkeypatch):
+    c, _ = windows
+    c.ticket_id = "ticket"
+    sent = []
+    c.api.resolve = lambda *args, **kwargs: sent.append(args)
+    monkeypatch.setattr(c, "_ask_unresolved", lambda: "")
+    c.resolve(False)
+    app.processEvents()
+    assert sent == []
 
 
 def test_changed_queue_does_not_jump_to_selection(app, windows):
@@ -475,10 +567,10 @@ def test_fps_label_uses_measured_rate_and_expires(windows, monkeypatch):
         clock[0] = index / 30
         o._record_video_frame()
     o._update_video_rate()
-    assert o.video_rate.text() == "30 FPS"
+    assert o.video_rate.text() == "30 кадр/с"
     clock[0] += 3
     o._update_video_rate()
-    assert o.video_rate.text() == "— FPS"
+    assert o.video_rate.text() == "— кадр/с"
 
 
 def test_client_publishes_60_after_loading_old_15_profile(app, monkeypatch, tmp_path):

@@ -51,6 +51,8 @@ CREATE TABLE tickets (
     assignee uuid,
     token_hash text NOT NULL,
     tunnel_id uuid,
+    client_media_secret text,
+    operator_media_secret text,
     created_at timestamptz NOT NULL DEFAULT now(),
     PRIMARY KEY (shard_id, id)
 ) PARTITION BY LIST (shard_id);
@@ -101,6 +103,7 @@ CREATE TABLE plan_steps (
     ticket_id uuid NOT NULL,
     body text NOT NULL,
     status text NOT NULL,
+    position integer NOT NULL DEFAULT 0,
     PRIMARY KEY (shard_id, id),
     FOREIGN KEY (shard_id, plan_id) REFERENCES plans (shard_id, id)
 ) PARTITION BY LIST (shard_id);

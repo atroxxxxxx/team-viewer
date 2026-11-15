@@ -1,6 +1,6 @@
 import unittest
 
-from support_protocol.media import media_action, should_open_player
+from support_protocol.media import media_action, session_ended, should_open_player
 
 
 class MediaActionTests(unittest.TestCase):
@@ -19,6 +19,9 @@ class MediaActionTests(unittest.TestCase):
     def test_stop_when_resolved(self):
         self.assertEqual(media_action("tunnel-a", "tunnel-a", "resolved"), "stop")
         self.assertEqual(media_action("", "tunnel-a", "resolved"), "idle")
+        self.assertTrue(session_ended("closed"))
+        self.assertEqual(media_action("tunnel-a", "tunnel-a", "closed"), "stop")
+        self.assertEqual(media_action("", "tunnel-a", "closed"), "idle")
 
 
 class PlayerTests(unittest.TestCase):
@@ -32,6 +35,7 @@ class PlayerTests(unittest.TestCase):
 
     def test_closed_ticket_does_not_play(self):
         self.assertFalse(should_open_player("", "tunnel-a", False, "resolved"))
+        self.assertFalse(should_open_player("tunnel-a", "tunnel-a", False, "closed"))
         self.assertFalse(should_open_player("", "", False, "queued"))
 
 
