@@ -27,7 +27,7 @@ type Store struct {
 }
 
 func Open(addr string) *Store {
-	return &Store{rdb: redis.NewClient(&redis.Options{Addr: addr})}
+	return &Store{rdb: redis.NewClient(&redis.Options{Addr: addr, ContextTimeoutEnabled: true})}
 }
 
 func (s *Store) Ping(ctx context.Context) error {

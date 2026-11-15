@@ -9,19 +9,18 @@ from client_app.input_session import InputSession
 
 from PyQt5.QtCore import QProcess, QTimer, Qt
 from PyQt5.QtWidgets import (
-    QFormLayout,
     QHBoxLayout,
-    QLabel,
+    QInputDialog,
     QLineEdit,
     QListWidget,
     QMessageBox,
     QPushButton,
     QPlainTextEdit,
     QVBoxLayout,
-    QWidget, QTabWidget, QScrollArea,
+    QWidget, QTabWidget,
 )
 
-from support_protocol.ui import Background, STYLE, connection_settings, card, header, label, secondary, StatusLabel, CheckBox, sync_rows
+from support_protocol.ui import Background, STYLE, connection_settings, card, header, label, secondary, StatusLabel, CheckBox, sync_chat, sync_rows
 from support_protocol.settings import UserSettings
 from support_protocol.api import TicketAPI
 from support_protocol.endpoints import config_file, load_endpoints
@@ -41,7 +40,7 @@ class ClientWindow(QWidget, Background):
         self.setWindowTitle("Клиент техподдержки")
         self.settings = UserSettings("client")
         api_base, relay_host, relay_port, username, password, tls_verify = self.settings.endpoints(load_endpoints(
-            config_file(ROOT / "config.yaml", "SUPPORT_CLIENT_CONFIG")
+            config_file(ROOT / "config.yaml", "SUPPORT_CLIENT_CONFIG"), password_env="CLIENT_PASSWORD"
         ))
         self.api = TicketAPI(api_base, username, password, verify=tls_verify)
         self.relay_host = relay_host
@@ -57,6 +56,7 @@ class ClientWindow(QWidget, Background):
         self.answered_grant = ""
         self.handled_inputs: set[str] = set()
         self._input_queue = deque()
+        self._input_results = {}
         self._input_session = InputSession()
         self._input_busy = False
         self._control = {}
@@ -65,6 +65,7 @@ class ClientWindow(QWidget, Background):
         self.init_background()
         self._polling = False
         self._creating = False
+        self._resolving = False
         self._build()
         self.timer = QTimer(self)
         self.timer.timeout.connect(self.refresh)
@@ -74,7 +75,6 @@ class ClientWindow(QWidget, Background):
 
     def _build(self) -> None:
         self.description = QPlainTextEdit()
-        self.description.setPlaceholderText("Что случилось")
         self.camera = CheckBox("Отдать камеру")
         self.dangerous = CheckBox("На экране диалог удаления или сброса")
         self.status = StatusLabel("Заявки нет")
@@ -172,6 +172,21 @@ class ClientWindow(QWidget, Background):
         self.resize(1050, 690)
         self.setMinimumSize(720, 540)
         self.restore_preferences(tabs)
+        self.start_button, self.chat_button, self.note_button = start, send, note
+        self.review_buttons = (yes, no)
+        self.chat_line.textChanged.connect(self._update_actions)
+        self.description.textChanged.connect(self._update_actions)
+        self.observation.textChanged.connect(self._update_actions)
+        self.steps.currentItemChanged.connect(self._update_actions)
+        self._update_actions()
+
+    def _update_actions(self):
+        active = bool(self.ticket_id)
+        self.start_button.setEnabled(not active and not self._creating and not self.description.document().isEmpty())
+        self.chat_button.setEnabled(active and bool(self.chat_line.text().strip()))
+        self.note_button.setEnabled(active and self.steps.currentItem() is not None and bool(self.observation.text().strip()))
+        for button in self.review_buttons:
+            button.setEnabled(active and not self._resolving)
 
     def start_ticket(self) -> None:
         text = self.description.toPlainText().strip()
@@ -186,6 +201,7 @@ class ClientWindow(QWidget, Background):
         self.status.setText("Создание заявки...")
         camera = self.camera.isChecked()
         self._creating = True
+        self._update_actions()
         def done(created):
             self._creating = False
             self._cancel_inputs()
@@ -194,8 +210,10 @@ class ClientWindow(QWidget, Background):
             self.api.ticket_token = created["ticket_token"]
             self.scale = 2
             self.status.setText(f"Заявка {self.ticket_id} ждёт оператора")
+            self._update_actions()
         def failed(error):
             self._creating = False
+            self._update_actions()
             self.report_error(error)
         self.run_background(lambda: self.api.create_ticket(self.account_id, text, camera), done, failed)
     def _publish(self, mode: str, url: str, gen: int, role: str) -> QProcess | None:
@@ -213,20 +231,20 @@ class ClientWindow(QWidget, Background):
         return proc
 
     def _on_publish_exit(self, gen: int, role: str, proc: QProcess) -> None:
-        if gen != self.media_gen or self._starting:
+        if gen != self.media_gen or proc not in self.procs:
             return
-        if proc in self.procs:
-            self.procs.remove(proc)
-        if role != "screen":
-            return
+        self.procs.remove(proc)
         err = bytes(proc.readAllStandardError()).decode("utf-8", errors="replace").strip()
+        proc.deleteLater()
+        if err:
+            log.error("FFmpeg %s stopped: %s", role, err)
+        if role != "screen":
+            self.status.setText("Камера недоступна")
+            return
         if not self.tunnel_id:
             self.screen_failed = True
         self.next_start = time.monotonic() + 2
         self.stop_media()
-        if err:
-            log.error("FFmpeg publisher stopped: %s", err)
-        proc.deleteLater()
         self.status.setText("Передача экрана прервана. Повторное подключение...")
 
     def _start_tunnel(self, account_id: str, tunnel_id: str, camera: bool) -> None:
@@ -287,6 +305,10 @@ class ClientWindow(QWidget, Background):
         ticket = session.get("ticket") or {}
         status = ticket.get("status", "")
         tunnel_id = ticket.get("tunnel_id") or ""
+        if status in {"resolved", "closed"}:
+            sync_chat(self.chat, session.get("messages") or [])
+            self._finish_ticket(status)
+            return
         if not self._starting:
             action = media_action(self.tunnel_id, tunnel_id, status)
             if action == "stop":
@@ -296,19 +318,9 @@ class ClientWindow(QWidget, Background):
                 self._start_tunnel(ticket.get("account_id") or self.account_id, tunnel_id, bool(ticket.get("camera")))
             elif self.bridge is None:
                 self.status.setText(f"{status} · {self.ticket_id}")
-        lines = [f"{item.get('author')}: {item.get('body')}" for item in session.get("messages") or []]
-        self.chat.setPlainText("\n".join(lines))
+        sync_chat(self.chat, session.get("messages") or [])
         sync_rows(self.steps, [(str(step.get("id", "")), f"{step.get('status')} {step.get('id')} {step.get('body')}")
                                for step in session.get("steps") or []])
-        if status == "resolved":
-            self._cancel_inputs()
-            self.stop_media()
-            self.ticket_id = ""
-            self.api.ticket_token = ""
-            self.answered_grant = ""
-            self.handled_inputs.clear()
-            self.status.setText("Заявка завершена")
-            return
         control = session.get("control") or {}
         self._control = control
         request = session.get("control_request") or {}
@@ -317,11 +329,29 @@ class ClientWindow(QWidget, Background):
         if pending.get("status") == "pending" and grant_id and grant_id != self.answered_grant:
             self.answered_grant = grant_id
             self._ask_control(grant_id)
-        for item in session.get("inputs") or []:
+        inputs = session.get("inputs") or []
+        pending_ids = {str(item.get("ID") or item.get("id") or "") for item in inputs}
+        self.handled_inputs.intersection_update(pending_ids)
+        for action_id in self._input_results.keys() - pending_ids:
+            del self._input_results[action_id]
+        self._update_actions()
+        for item in inputs:
             action_id = str(item.get("ID") or item.get("id") or "")
             if action_id and action_id not in self.handled_inputs:
                 self.handled_inputs.add(action_id)
                 self._apply_input(action_id, item)
+        self._drain_input()
+
+    def _finish_ticket(self, status):
+        self._cancel_inputs()
+        self.stop_media()
+        self.ticket_id = ""
+        self.api.ticket_token = ""
+        self.answered_grant = ""
+        self.handled_inputs.clear()
+        self.status.setText("Заявка закрыта без решения" if status == "closed" else "Заявка завершена")
+        self._update_actions()
+
     def _ask_control(self, grant_id: str) -> None:
         answer = QMessageBox.question(self, "Управление", "Разрешить оператору мышь и клавиатуру в этой сессии? Оболочка и удаление файлов недоступны.")
         allow = answer == QMessageBox.Yes
@@ -335,6 +365,7 @@ class ClientWindow(QWidget, Background):
     def _cancel_inputs(self):
         self._input_session.cancel()
         self._input_queue.clear()
+        self._input_results.clear()
         self._input_busy = False
         self._control = {}
 
@@ -343,13 +374,19 @@ class ClientWindow(QWidget, Background):
         self._drain_input()
 
     def _drain_input(self):
-        if self._input_busy or not self._input_queue or self._closing or not self.ticket_id:
+        if self._input_busy or self._closing or not self.ticket_id:
             return
         token = self._input_session
         if token.cancelled.is_set():
             return
-        action_id, item = self._input_queue.popleft()
         ticket_id = self.ticket_id
+        if self._input_results:
+            action_id, result = next(iter(self._input_results.items()))
+            self._send_input_result(ticket_id, token, action_id, result)
+            return
+        if not self._input_queue:
+            return
+        action_id, item = self._input_queue.popleft()
         self._input_busy = True
         detail = item.get("Detail") or item.get("detail") or {}
         if not isinstance(detail, dict):
@@ -372,19 +409,37 @@ class ClientWindow(QWidget, Background):
             if token.cancelled.is_set():
                 return
             phase = "applied" if not current_reason and observation == "ввод исполнен в сессии клиента" else "rejected_by_client"
-            return self.api.finish_input(ticket_id, action_id, phase, observation)
+            return phase, observation
 
-        def finished(_):
+        def finished(result):
             if token is self._input_session and not token.cancelled.is_set():
                 self._input_busy = False
+                if result is not None:
+                    self._send_input_result(ticket_id, token, action_id, result)
+
+        def failed(error):
+            if token is self._input_session and not token.cancelled.is_set():
+                self._input_busy = False
+                self.report_error(error)
+
+        self.run_background(execute, finished, failed)
+
+    def _send_input_result(self, ticket_id, token, action_id, result):
+        self._input_busy = True
+        self._input_results[action_id] = result
+
+        def done(_):
+            if token is self._input_session and not token.cancelled.is_set():
+                self._input_busy = False
+                self._input_results.pop(action_id, None)
                 QTimer.singleShot(0, self._drain_input)
 
         def failed(error):
             if token is self._input_session and not token.cancelled.is_set():
+                self._input_busy = False
                 self.report_error(error)
-                finished(None)
 
-        self.run_background(execute, finished, failed)
+        self.run_background(lambda: self.api.finish_input(ticket_id, action_id, *result), done, failed)
 
     def _inject(self, event: dict, token: InputSession) -> str:
         xdotool = "xdotool"
@@ -424,8 +479,29 @@ class ClientWindow(QWidget, Background):
                                 lambda _: self.observation.clear() if self.ticket_id == ticket_id and self.observation.text() == draft else None)
     def resolve(self, accept: bool) -> None:
         ticket_id = self.ticket_id
-        if ticket_id:
-            self.run_background(lambda: self.api.resolve(ticket_id, "client", accept))
+        if not ticket_id or self._resolving:
+            return
+        self._resolving = True
+        self._update_actions()
+
+        def finished(_=None):
+            self._resolving = False
+            self._update_actions()
+            self.refresh()
+
+        def failed(error):
+            self._resolving = False
+            self._update_actions()
+            self.report_error(error)
+
+        if accept:
+            self.run_background(lambda: self.api.resolve(ticket_id, "client", True), finished, failed)
+            return
+        comment, confirmed = QInputDialog.getMultiLineText(self, "Закрыть без решения", "Что осталось нерешённым?")
+        if confirmed and comment.strip() and self.ticket_id == ticket_id:
+            self.run_background(lambda: self.api.resolve(ticket_id, "client", False, comment, close=True), finished, failed)
+        else:
+            finished()
     def _guarded(self, call) -> None:
         if self.ticket_id:
             self.run_background(call)
@@ -433,8 +509,11 @@ class ClientWindow(QWidget, Background):
         self.media_gen += 1
         self.tunnel_id = ""
         for proc in self.procs:
-            proc.finished.connect(proc.deleteLater)
-            proc.kill()
+            if proc.state() == QProcess.NotRunning:
+                proc.deleteLater()
+            else:
+                proc.finished.connect(proc.deleteLater)
+                proc.kill()
         self.procs.clear()
         if self.bridge is not None:
             self.bridge.close()

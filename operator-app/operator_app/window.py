@@ -16,11 +16,11 @@ from PyQt5.QtWidgets import (
     QPushButton,
     QPlainTextEdit,
     QVBoxLayout,
-    QWidget, QTabWidget, QSplitter,
+    QWidget, QTabWidget, QSplitter, QScrollArea,
 )
 
 from operator_app.model_process import ModelProcess
-from support_protocol.ui import Background, STYLE, connection_settings, card, header, label, secondary, StatusLabel, CheckBox, DesktopPreview, sync_rows
+from support_protocol.ui import Background, STYLE, connection_settings, card, header, label, secondary, StatusLabel, CheckBox, DesktopPreview, sync_chat, sync_rows
 from support_protocol.settings import UserSettings
 from support_protocol.api import TicketAPI
 from support_protocol.endpoints import config_file, load_endpoints
@@ -42,7 +42,7 @@ class OperatorWindow(QWidget, Background):
         self.setWindowTitle("Оператор техподдержки")
         self.settings = UserSettings("operator")
         api_base, relay_host, relay_port, username, password, tls_verify = self.settings.endpoints(load_endpoints(
-            config_file(ROOT / "config.yaml", "SUPPORT_OPERATOR_CONFIG")
+            config_file(ROOT / "config.yaml", "SUPPORT_OPERATOR_CONFIG"), password_env="OPERATOR_PASSWORD"
         ))
         self.api = TicketAPI(api_base, username, password, verify=tls_verify)
         self.relay_host = relay_host
@@ -84,7 +84,6 @@ class OperatorWindow(QWidget, Background):
         self.queue = QListWidget()
         self.status = StatusLabel("Очередь пуста")
         self.preview = DesktopPreview("Экран появится после захвата")
-        self.preview.setFixedSize(FRAME_WIDTH, FRAME_HEIGHT)
         self.preview.setAlignment(Qt.AlignCenter)
         self.preview.mousePressEvent = self.preview_click
         self.preview.framePainted.connect(self._record_video_frame)
@@ -105,7 +104,7 @@ class OperatorWindow(QWidget, Background):
             )
         self.model_note.setWordWrap(True)
         self.text_input = QLineEdit()
-        self.text_input.setPlaceholderText("Текст в поле программы клиента")
+        self.text_input.setPlaceholderText("Текст для ввода")
         refresh = QPushButton("Обновить очередь")
         refresh.clicked.connect(self.reload_queue)
         claim = QPushButton("Захватить")
@@ -131,7 +130,6 @@ class OperatorWindow(QWidget, Background):
         self.status.setObjectName("status")
         self.status.setWordWrap(True)
         self.preview.setMinimumSize(280, 160)
-        self.preview.setMaximumSize(16777215, 16777215)
         self.preview.setWordWrap(True)
         self.chat_line.setPlaceholderText("Сообщение клиенту")
         for button in (refresh, send, done, nested, close, typed):
@@ -160,12 +158,12 @@ class OperatorWindow(QWidget, Background):
         plan_layout = QVBoxLayout(plan_page)
         plan_layout.setContentsMargins(0, 16, 0, 0)
         plan_layout.setSpacing(8)
+        self.steps.setMinimumHeight(100)
+        self.plan_text.setMinimumHeight(100)
         plan_layout.addWidget(self.steps, 1)
         plan_layout.addWidget(self.plan_text, 1)
-        plan_row = QHBoxLayout()
-        plan_row.addWidget(plan)
-        plan_row.addWidget(done)
-        plan_layout.addLayout(plan_row)
+        plan_layout.addWidget(plan)
+        plan_layout.addWidget(done)
         plan_layout.addWidget(self.problem)
         plan_layout.addWidget(nested)
         plan_layout.addWidget(close)
@@ -181,7 +179,12 @@ class OperatorWindow(QWidget, Background):
         tabs = QTabWidget()
         tabs.addTab(queue_page, "Заявки")
         tabs.addTab(chat_page, "Чат")
-        tabs.addTab(plan_page, "План")
+        plan_scroll = QScrollArea()
+        plan_scroll.setWidgetResizable(True)
+        plan_scroll.setFrameShape(QScrollArea.NoFrame)
+        plan_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        plan_scroll.setWidget(plan_page)
+        tabs.addTab(plan_scroll, "План")
         tabs.addTab(tools_page, "Модель")
         sidebar, side_layout = card()
         side_layout.addWidget(label("РАБОЧЕЕ ПРОСТРАНСТВО", "eyebrow"))
@@ -220,6 +223,31 @@ class OperatorWindow(QWidget, Background):
         self.resize(1200, 760)
         self.setMinimumSize(850, 580)
         self.restore_preferences(tabs, split)
+        self.claim_button, self.chat_button, self.control_button, self.type_button = claim, send, control, typed
+        self.plan_actions = (plan, done, nested, close)
+        for field in (self.chat_line, self.text_input, self.problem, self.plan_text):
+            field.textChanged.connect(self._update_actions)
+        self.queue.currentItemChanged.connect(self._update_actions)
+        self.steps.currentItemChanged.connect(self._update_actions)
+        self._update_actions()
+
+    def _update_actions(self):
+        active = bool(self.ticket_id)
+        grant = self.session.get("control") or {}
+        can_type = grant.get("status") == "active" and "text" in (grant.get("scope") or "").split(",")
+        pending = self.session.get("control_request") or grant
+        self.claim_button.setEnabled(not active and not self._claiming and self.queue.currentItem() is not None)
+        self.chat_button.setEnabled(active and bool(self.chat_line.text().strip()))
+        self.control_button.setEnabled(active and pending.get("status") not in {"pending", "active"})
+        self.type_button.setEnabled(active and can_type and bool(self.text_input.text().strip()))
+        plan, done, nested, close = self.plan_actions
+        has_draft = bool(self.plan_text.toPlainText().strip())
+        has_step = self.steps.currentItem() is not None
+        plan.setEnabled(active and has_draft)
+        done.setEnabled(active and has_step)
+        nested.setEnabled(active and has_step and has_draft and bool(self.problem.text().strip()))
+        close.setEnabled(active)
+        self.model_button.setEnabled(active and self.models is not None and not self._model_jobs)
 
     def reload_queue(self) -> None:
         if self._closing or self._editing_settings or self._queue_polling:
@@ -251,17 +279,20 @@ class OperatorWindow(QWidget, Background):
             return
         ticket_id = item.text().split()[0]
         self._claiming = True
+        self._update_actions()
         def done(claimed):
             self._claiming = False
             self.ticket_id = ticket_id
+            self._update_actions()
             self.status.setText(f"Заявка {ticket_id} захвачена")
             self._sync_player(claimed["account_id"], claimed["tunnel_id"], "assigned")
         def failed(error):
             self._claiming = False
+            self._update_actions()
             self.report_error(error)
         self.run_background(lambda: self.api.claim(ticket_id), done, failed)
     def _sync_player(self, account_id: str, tunnel_id: str, status: str) -> None:
-        if status == "resolved" or not tunnel_id:
+        if status in {"resolved", "closed"} or not tunnel_id:
             self._stop_play()
             return
         running = self.player is not None and self.player.state() != QProcess.NotRunning
@@ -391,21 +422,25 @@ class OperatorWindow(QWidget, Background):
 
     def _show_session(self) -> None:
         ticket = self.session.get("ticket") or {}
-        self._sync_player(ticket.get("account_id") or "", ticket.get("tunnel_id") or "", ticket.get("status") or "")
-        self.status.setText(f"{ticket.get('status', '')} · {self.ticket_id}")
-        if ticket.get("status") == "resolved":
-            self.ticket_id = ""
-            self.session = {}
-            self.frame = None
-            self.preview.clear()
-            self.preview.setText("Сеанс завершён")
-            self.status.setText("Заявка завершена")
-            self.reload_queue()
+        status = ticket.get("status") or ""
+        if status in {"resolved", "closed"}:
+            self._finish_ticket(status)
             return
-        lines = [f"{item.get('author')}: {item.get('body')}" for item in self.session.get("messages") or []]
-        self.chat.setPlainText("\n".join(lines))
+        self._sync_player(ticket.get("account_id") or "", ticket.get("tunnel_id") or "", status)
+        self.status.setText(f"{status} · {self.ticket_id}")
+        sync_chat(self.chat, self.session.get("messages") or [])
         sync_rows(self.steps, [(str(step.get("id", "")), f"{step.get('status')} {step.get('id')} {step.get('body')}")
                                for step in self.session.get("steps") or []])
+        self._update_actions()
+    def _finish_ticket(self, status):
+        self._stop_play()
+        self.ticket_id = ""
+        self.session = {}
+        self.preview.setText("Сеанс завершён")
+        self.status.setText("Заявка закрыта без решения" if status == "closed" else "Заявка завершена")
+        self._update_actions()
+        self.reload_queue()
+
     def preview_click(self, event) -> None:
         if not self.ticket_id:
             return
@@ -484,7 +519,7 @@ class OperatorWindow(QWidget, Background):
         self.model_note.setText("Подготовка моделей...")
         def ready(models):
             self.models = models
-            self.model_button.setEnabled(True)
+            self._update_actions()
             self.allow_model_input.setEnabled(True)
             self.model_note.setText("Профиль {profile}: текст {text_repo}, кадр {vision_repo}, решение {decision_repo}. {reason}".format(**models))
         def failed(error):
@@ -508,11 +543,11 @@ class OperatorWindow(QWidget, Background):
         self.model_button.setEnabled(False)
         self.status.setText("Модель обрабатывает заявку...")
         def done(action):
-            self.model_button.setEnabled(True)
+            self._update_actions()
             if self.ticket_id == ticket_id:
                 self._apply_model(action)
         def failed(error):
-            self.model_button.setEnabled(True)
+            self._update_actions()
             self.status.setText(f"Модель недоступна: {error}")
         ModelProcess(self, "action", {"models": models, "context": context,
                                       "frame": base64.b64encode(png).decode("ascii") if png else None}, done, failed)

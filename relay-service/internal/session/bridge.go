@@ -3,6 +3,7 @@ package session
 import (
 	"bufio"
 	"context"
+	"crypto/tls"
 	"io"
 	"net"
 	"strings"
@@ -14,7 +15,13 @@ import (
 type Bridge struct {
 	addr     string
 	rtspAddr string
-	store    *Store
+	store    tunnelLookup
+	TLS      *tls.Config
+}
+
+type tunnelLookup interface {
+	ByClient(context.Context, string) (Tunnel, error)
+	ByTunnel(context.Context, string) (Tunnel, error)
 }
 
 func NewBridge(addr, rtspAddr string, store *Store) *Bridge {
@@ -23,6 +30,9 @@ func NewBridge(addr, rtspAddr string, store *Store) *Bridge {
 
 func (b *Bridge) Serve(ctx context.Context) error {
 	ln, err := net.Listen("tcp", b.addr)
+	if err == nil && b.TLS != nil {
+		ln = tls.NewListener(ln, b.TLS)
+	}
 	if err != nil {
 		return err
 	}
@@ -39,43 +49,35 @@ func (b *Bridge) Serve(ctx context.Context) error {
 			logx.Error("session accept", map[string]any{"err": err.Error()})
 			continue
 		}
-		go b.handle(conn)
+		go b.handle(ctx, conn)
 	}
 }
 
-func (b *Bridge) handle(front net.Conn) {
+func (b *Bridge) handle(ctx context.Context, front net.Conn) {
 	defer front.Close()
-	_ = front.SetReadDeadline(time.Now().Add(5 * time.Second))
+	_ = front.SetDeadline(time.Now().Add(5 * time.Second))
 	reader := bufio.NewReader(front)
-	line, err := reader.ReadString('\n')
+	line, err := reader.ReadSlice('\n')
 	if err != nil {
 		return
 	}
-	_ = front.SetReadDeadline(time.Time{})
-	role, clientID, ok := parseHello(line)
+	_ = front.SetDeadline(time.Time{})
+	role, clientID, ok := parseHello(string(line))
 	if !ok {
 		return
 	}
-	if _, err := b.store.ByClient(context.Background(), clientID); err != nil {
+	tunnel, err := b.store.ByClient(ctx, clientID)
+	if err != nil {
 		logx.Info("session denied", map[string]any{"role": role})
 		return
 	}
-	back, err := net.Dial("tcp", b.rtspAddr)
+	back, err := net.DialTimeout("tcp", b.rtspAddr, 3*time.Second)
 	if err != nil {
 		logx.Error("rtsp dial", map[string]any{"err": err.Error()})
 		return
 	}
 	defer back.Close()
-	if reader.Buffered() > 0 {
-		pending := make([]byte, reader.Buffered())
-		if _, err := io.ReadFull(reader, pending); err != nil {
-			return
-		}
-		if _, err := back.Write(pending); err != nil {
-			return
-		}
-	}
-	logx.Info("session joined", map[string]any{"role": role, "client_id": clientID})
+	logx.Info("session joined", map[string]any{"role": role, "tunnel_id": tunnel.TunnelID})
 	done := make(chan struct{}, 2)
 	go func() {
 		_, _ = io.Copy(back, reader)
@@ -85,7 +87,23 @@ func (b *Bridge) handle(front net.Conn) {
 		_, _ = io.Copy(front, back)
 		done <- struct{}{}
 	}()
-	<-done
+	ticker := time.NewTicker(time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-done:
+			return
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			check, cancel := context.WithTimeout(ctx, time.Second)
+			_, err := b.store.ByTunnel(check, tunnel.TunnelID)
+			cancel()
+			if err != nil {
+				return
+			}
+		}
+	}
 }
 
 func parseHello(line string) (role, clientID string, ok bool) {

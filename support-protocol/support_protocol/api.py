@@ -16,6 +16,7 @@ class TicketAPI:
         self.password = password
         self.verify = verify
         self.ticket_token = ""
+        self._chat_cache = ("", [])
         self._log_lock = threading.Lock()
         self._last_error = None
         self._last_error_at = 0.0
@@ -33,7 +34,12 @@ class TicketAPI:
         return self._json("POST", f"/api/v1/tickets/{ticket_id}/claim", {})
 
     def session(self, ticket_id: str) -> dict:
-        return self._json("GET", f"/api/v1/tickets/{ticket_id}/session")
+        cached_id, cached_messages = self._chat_cache
+        known = len(cached_messages) if cached_id == ticket_id else -1
+        result = self._json("GET", f"/api/v1/tickets/{ticket_id}/session?known_messages={known}")
+        messages = result.setdefault("messages", cached_messages if cached_id == ticket_id else [])
+        self._chat_cache = ("", []) if (result.get("ticket") or {}).get("status") in {"resolved", "closed"} else (ticket_id, messages)
+        return result
 
     def message(self, ticket_id: str, author: str, body: str) -> dict:
         return self._json("POST", f"/api/v1/tickets/{ticket_id}/messages", {"author": author, "body": body})
@@ -85,11 +91,11 @@ class TicketAPI:
             {"parent_step_id": parent_step_id, "description": description, "steps": steps},
         )
 
-    def resolve(self, ticket_id: str, role: str, accept: bool, comment: str = "") -> dict:
+    def resolve(self, ticket_id: str, role: str, accept: bool, comment: str = "", *, close: bool = False) -> dict:
         return self._json(
             "POST",
             f"/api/v1/tickets/{ticket_id}/resolution",
-            {"role": role, "accept": accept, "comment": comment},
+            {"role": role, "accept": accept, "comment": comment, **({"close": True} if close else {})},
         )
 
     def health(self):

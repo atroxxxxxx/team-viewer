@@ -73,7 +73,7 @@ def lock_ticket(session: Session, shard_id: int, ticket_id: uuid.UUID) -> Ticket
     )
     if ticket is None:
         raise NotFound()
-    if ticket.status == "resolved":
+    if ticket.status in {"resolved", "closed"}:
         raise Conflict()
     return ticket
 
@@ -94,6 +94,14 @@ def add_message(session: Session, shard_id: int, ticket_id: uuid.UUID, author: s
     lock_ticket(session, shard_id, ticket_id)
     session.add(ChatMessage(shard_id=shard_id, id=uuid.uuid4(), ticket_id=ticket_id, author=author, body=body))
     _action(session, shard_id, ticket_id, author, "chat", "applied")
+
+
+def message_count(session: Session, shard_id: int, ticket_id: uuid.UUID) -> int:
+    return session.scalar(
+        select(func.count()).select_from(ChatMessage).where(
+            ChatMessage.shard_id == shard_id, ChatMessage.ticket_id == ticket_id,
+        )
+    )
 
 
 def messages(session: Session, shard_id: int, ticket_id: uuid.UUID) -> list[ChatMessage]:
@@ -289,46 +297,64 @@ def confirm(session: Session, shard_id: int, ticket_id: uuid.UUID, role: str, ac
     client_yes = _latest_accept(session, shard_id, ticket_id, "client")
     status = "resolved" if operator_yes and client_yes else "awaiting_client"
     if status == "resolved":
-        session.execute(
-            update(ControlGrant)
-            .where(
-                ControlGrant.shard_id == shard_id,
-                ControlGrant.ticket_id == ticket_id,
-                ControlGrant.status.in_(("active", "pending")),
-            )
-            .values(status="revoked", scope="", expires_at=now)
-        )
-        session.execute(
-            update(ActionLog)
-            .where(
-                ActionLog.shard_id == shard_id,
-                ActionLog.ticket_id == ticket_id,
-                ActionLog.phase == "proposed",
-                ActionLog.detail["type"].astext.in_(("pointer", "key", "text")),
-            )
-            .values(phase="cancelled")
-        )
-        session.execute(
-            update(ChatMember)
-            .where(
-                ChatMember.shard_id == shard_id,
-                ChatMember.ticket_id == ticket_id,
-                ChatMember.role == "operator",
-                ChatMember.left_at.is_(None),
-            )
-            .values(left_at=func.now())
-        )
-    ticket.status = status
+        end_session(session, ticket, status, now)
+    else:
+        ticket.status = status
     return status
 
 
-def pending_inputs(session: Session, shard_id: int, ticket_id: uuid.UUID) -> list[ActionLog]:
-    rows = session.scalars(
-        select(ActionLog)
-        .where(ActionLog.shard_id == shard_id, ActionLog.ticket_id == ticket_id, ActionLog.phase == "proposed")
-        .order_by(ActionLog.created_at)
+def close_unresolved(session, shard_id, ticket_id, now):
+    ticket = lock_ticket(session, shard_id, ticket_id)
+    end_session(session, ticket, "closed", now)
+    return ticket.status
+
+
+def end_session(session, ticket, status, now):
+    shard_id, ticket_id = ticket.shard_id, ticket.id
+    session.execute(
+        update(ControlGrant)
+        .where(
+            ControlGrant.shard_id == shard_id,
+            ControlGrant.ticket_id == ticket_id,
+            ControlGrant.status.in_(("active", "pending")),
+        )
+        .values(status="revoked", scope="", expires_at=now)
     )
-    return [row for row in rows if isinstance(row.detail, dict) and row.detail.get("type") in {"pointer", "key", "text"}]
+    session.execute(
+        update(ActionLog)
+        .where(
+            ActionLog.shard_id == shard_id,
+            ActionLog.ticket_id == ticket_id,
+            ActionLog.phase == "proposed",
+            ActionLog.detail["type"].astext.in_(("pointer", "key", "text")),
+        )
+        .values(phase="cancelled")
+    )
+    session.execute(
+        update(ChatMember)
+        .where(
+            ChatMember.shard_id == shard_id,
+            ChatMember.ticket_id == ticket_id,
+            ChatMember.role == "operator",
+            ChatMember.left_at.is_(None),
+        )
+        .values(left_at=func.now())
+    )
+    ticket.status = status
+
+
+def pending_inputs(session: Session, shard_id: int, ticket_id: uuid.UUID) -> list[ActionLog]:
+    return list(session.scalars(
+        select(ActionLog)
+        .where(
+            ActionLog.shard_id == shard_id,
+            ActionLog.ticket_id == ticket_id,
+            ActionLog.phase == "proposed",
+            ActionLog.detail["type"].astext.in_(("pointer", "key", "text")),
+        )
+        .order_by(ActionLog.created_at, ActionLog.id)
+        .limit(100)
+    ))
 
 
 def confirmations(session: Session, shard_id: int, ticket_id: uuid.UUID) -> list[Confirmation]:

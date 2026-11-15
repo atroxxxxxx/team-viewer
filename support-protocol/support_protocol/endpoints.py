@@ -13,7 +13,7 @@ def config_file(default: Path, env_name: str) -> Path:
     return default
 
 
-def load_endpoints(path: Path) -> tuple[str, str, int, str, str, bool]:
+def load_endpoints(path: Path, *, password_env: str | None = None) -> tuple[str, str, int, str, str, bool]:
     try:
         data = yaml.safe_load(path.read_text(encoding="utf-8"))
         ticket, relay, auth = data["ticket"], data["relay"], data["auth"]
@@ -27,7 +27,8 @@ def load_endpoints(path: Path) -> tuple[str, str, int, str, str, bool]:
         verify = ticket.get("tls_verify", True)
         if isinstance(verify, str):
             verify = verify.lower() not in {"0", "false", "no"}
-        return api, relay["host"], port, auth["username"], auth["password"], bool(verify)
+        password = (os.environ.get(password_env) if password_env else None) or auth["password"]
+        return api, relay["host"], port, auth["username"], password, bool(verify)
     except (OSError, ValueError, TypeError, KeyError, AttributeError, yaml.YAMLError) as exc:
         # YAML traceback может содержать строку с паролем: пишем тип и позицию без исходного текста.
         mark = getattr(exc, "problem_mark", None)

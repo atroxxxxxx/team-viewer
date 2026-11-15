@@ -268,7 +268,7 @@ def test_queued_input_rechecks_session_and_permission(app, windows, end_session)
         else:
             c._control = {"status": "revoked"}
         release.set()
-        pump(app, lambda: pool.activeThreadCount() == 0)
+        pump(app, lambda: not c._input_busy and pool.activeThreadCount() == 0)
         app.processEvents()
         assert not injected
         if not end_session:
@@ -493,6 +493,8 @@ def test_client_publishes_60_after_loading_old_15_profile(app, monkeypatch, tmp_
         captured = []
         monkeypatch.setattr(client_module, "publish_args", lambda *a, **kw: captured.append(kw) or ["not-started"])
         class Process:
+            NotRunning = 0
+            def state(self): return self.NotRunning
             def __init__(self, *_):
                 self.finished = SimpleSignal()
                 self.errorOccurred = SimpleSignal()
@@ -526,3 +528,65 @@ def test_fps_dialog_accepts_user_rate_above_previous_cap(app, windows, fps):
     QTimer.singleShot(0, apply)
     connection_settings(c)
     assert UserSettings("client").get("video_fps") == fps
+
+def test_chat_refresh_keeps_selection_and_scroll(app, windows):
+    from PyQt5.QtGui import QTextCursor
+    from support_protocol.ui import sync_chat
+
+    _, operator = windows
+    operator.show()
+    operator.findChild(QTabWidget).setCurrentIndex(1)
+    messages = [{"author": "client", "body": str(i)} for i in range(200)]
+    sync_chat(operator.chat, messages)
+    app.processEvents()
+    cursor = operator.chat.textCursor()
+    cursor.setPosition(9)
+    cursor.setPosition(12, QTextCursor.KeepAnchor)
+    operator.chat.setTextCursor(cursor)
+    scroll = operator.chat.verticalScrollBar()
+    scroll.setValue(scroll.maximum() // 2)
+    saved = scroll.value(), operator.chat.textCursor().selectedText()
+    assert saved[0] > 0 and saved[1]
+    sync_chat(operator.chat, messages)
+    assert (scroll.value(), operator.chat.textCursor().selectedText()) == saved
+    sync_chat(operator.chat, messages + [{"author": "client", "body": "new"}])
+    assert (scroll.value(), operator.chat.textCursor().selectedText()) == saved
+
+
+def test_camera_process_is_deleted_after_failure(app, windows, monkeypatch):
+    import sys
+    from PyQt5.QtCore import QEvent, QProcess
+
+    client, _ = windows
+    monkeypatch.setattr(client_module, "publish_args", lambda *a, **k: [sys.executable, "-c", "raise SystemExit(1)"])
+    client._publish("camera", "rtsp://localhost/camera", client.media_gen, "camera")
+    pump(app, lambda: not client.procs)
+    app.sendPostedEvents(None, QEvent.DeferredDelete)
+    assert not client.findChildren(QProcess)
+
+def test_input_result_retries_without_repeating_local_input(app, windows):
+    from support_protocol.errors import ServiceUnavailable
+
+    client, _ = windows
+    _grant(client)
+    local_calls, acknowledgements = [], []
+
+    def inject(*args):
+        local_calls.append(args)
+        return "ввод исполнен в сессии клиента"
+
+    def finish(*args):
+        acknowledgements.append(args)
+        if len(acknowledgements) == 1:
+            raise ServiceUnavailable()
+
+    client._inject = inject
+    client.api.finish_input = finish
+    item = {"id": "retry", "detail": {"type": "text", "intent": "type_in_field", "text": "hello"}}
+    session = {"ticket": {"status": "remote_control"}, "inputs": [item], "control": client._control}
+    client._show_session(session)
+    pump(app, lambda: len(acknowledgements) == 1 and not client._input_busy)
+    client._show_session(session)
+    pump(app, lambda: len(acknowledgements) == 2 and not client._input_busy)
+    assert len(local_calls) == 1
+    assert acknowledgements[0] == acknowledgements[1]

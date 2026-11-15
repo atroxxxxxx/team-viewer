@@ -15,12 +15,16 @@ jobs:
       - name: Install system dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y python3-venv postgresql-16
+          sudo apt-get install -y python3-venv postgresql-16 libegl1 libgl1
       - name: Set up environment
         run: sh dev.sh setup --postgres
+      - name: Install desktop test dependencies
+        run: .venv/bin/python -m pip install PyQt5
       - name: Start project database
         run: sh dev.sh db-start
       - name: Run tests
+        env:
+          QT_QPA_PLATFORM: offscreen
         run: sh dev.sh test -q
       - name: Check dependencies and sources
         run: sh dev.sh check
@@ -30,3 +34,16 @@ jobs:
           if [ -f .dev/pgdata/postmaster.pid ]; then
             sh dev.sh db-stop
           fi
+
+  relay:
+    runs-on: ubuntu-24.04
+    defaults:
+      run:
+        working-directory: relay-service
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: relay-service/go.mod
+          cache-dependency-path: relay-service/go.sum
+      - run: go test ./...

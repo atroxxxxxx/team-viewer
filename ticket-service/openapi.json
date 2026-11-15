@@ -85,7 +85,7 @@
       "post": {"summary": "Дочерняя проблема и вложенный план", "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}}], "responses": {"201": {"description": "проблема создана"}}}
     },
     "/api/v1/tickets/{id}/resolution": {
-      "post": {"summary": "Подтверждение решения клиентом или оператором", "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}}], "responses": {"200": {"description": "статус сессии"}}}
+      "post": {"summary": "Подтверждение решения или закрытие клиентом без решения", "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "required": ["accept"], "properties": {"accept": {"type": "boolean"}, "close": {"type": "boolean", "default": false}, "comment": {"type": "string"}}}}}}, "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}}], "responses": {"200": {"description": "статус сессии"}}}
     }
   }
 }

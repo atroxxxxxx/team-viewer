@@ -50,13 +50,13 @@ services:
       HTTP_ADDR: 0.0.0.0:18080
       DATABASE_URL: postgres://support:support@postgres:5432/support?sslmode=disable
       RELAY_INGEST_URL: http://relay:18082
-      RELAY_INGEST_TOKEN: ${RELAY_INGEST_TOKEN:-k7R_wQ3nM8pL2vX9cH4sD6fB1aY0uT5e}
+      RELAY_INGEST_TOKEN: ${RELAY_INGEST_TOKEN:?Set RELAY_INGEST_TOKEN}
       SWAGGER_DOC_URL: /openapi/tickets.json
       SHARD_COUNT: "4"
       CLIENT_USER: client
-      CLIENT_PASSWORD: ${CLIENT_PASSWORD:-Yuvr4_U4n4uKy5eois-o55Z5reI6pKFT}
+      CLIENT_PASSWORD: ${CLIENT_PASSWORD:?Set CLIENT_PASSWORD}
       OPERATOR_USER: operator
-      OPERATOR_PASSWORD: ${OPERATOR_PASSWORD:-czixyK5esSuS2d990aicwQ-ruCSXt5Xp}
+      OPERATOR_PASSWORD: ${OPERATOR_PASSWORD:?Set OPERATOR_PASSWORD}
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:18080/health')"]
       interval: 2s
@@ -73,14 +73,14 @@ services:
     build: ./relay-service
     restart: unless-stopped
     ports:
-      - "18082:18082"
-      - "8554:8554"
+      - "127.0.0.1:8554:8554"
     environment:
       INGEST_ADDR: 0.0.0.0:18082
       SESSION_ADDR: :8554
+      SESSION_LOCAL_PLAINTEXT: "1"
       RTSP_ADDR: 127.0.0.1:18554
       REDIS_ADDR: redis:6379
-      RELAY_INGEST_TOKEN: ${RELAY_INGEST_TOKEN:-k7R_wQ3nM8pL2vX9cH4sD6fB1aY0uT5e}
+      RELAY_INGEST_TOKEN: ${RELAY_INGEST_TOKEN:?Set RELAY_INGEST_TOKEN}
     depends_on:
       redis:
         condition: service_healthy

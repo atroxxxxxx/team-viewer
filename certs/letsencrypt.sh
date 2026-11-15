@@ -272,16 +272,6 @@ server {
     ssl_certificate_key /etc/letsencrypt/live/relay/privkey.pem;
     ssl_protocols TLSv1.2 TLSv1.3;
 
-    location /health {
-        proxy_pass http://127.0.0.1:18082/health;
-    }
-
-    location /api/ {
-        proxy_set_header Host \$host;
-        proxy_set_header X-Forwarded-Proto https;
-        proxy_pass http://127.0.0.1:18082;
-    }
-
     location / {
         return 444;
     }

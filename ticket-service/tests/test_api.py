@@ -316,3 +316,29 @@ def test_concurrent_confirmations_close_once(api):
         assert second.result(timeout=10).status_code == 200
     assert api.session()["ticket"]["status"] == "resolved"
     assert len(api.relay.closes) == 1
+
+
+def test_close_without_solution_accepts_multiline_feedback_and_revokes_session(api):
+    api.claim()
+    api.allow_control()
+    reason = "Проблема осталась\nСбой повторяется"
+    response = api.client("/resolution", {"accept": False, "close": True, "comment": reason})
+    assert response.status_code == 200
+    assert response.json()["status"] == "closed"
+    assert api.relay.closes == [uuid.UUID(api.id)]
+    snapshot = api.session()
+    assert snapshot["control"] == {}
+    assert snapshot["messages"][-1]["body"] == reason
+    assert api.client("/messages", {"body": "после закрытия"}).status_code == 409
+
+
+def test_session_can_omit_unchanged_chat_history(api):
+    def snapshot(known):
+        return api.http.get(api.path + "/session", auth=CLIENT, headers=api.headers,
+                            params={"known_messages": known}).json()
+
+    assert "messages" not in snapshot(0)
+    assert api.client("/messages", {"body": "один"}).status_code == 201
+    assert [msg["body"] for msg in snapshot(0)["messages"]] == ["один"]
+    assert "messages" not in snapshot(1)
+    assert "messages" in api.session()
