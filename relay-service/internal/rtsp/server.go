@@ -72,7 +72,7 @@ func (s *Server) OnSessionClose(ctx *gortsplib.ServerHandlerOnSessionCloseCtx) {
 }
 
 func (s *Server) OnDescribe(ctx *gortsplib.ServerHandlerOnDescribeCtx) (*base.Response, *gortsplib.ServerStream, error) {
-	if err := s.allow(ctx.Conn.NetConn(), ctx.Path); err != nil {
+	if err := s.allow(ctx.Conn.NetConn(), ctx.Path, false); err != nil {
 		return &base.Response{StatusCode: base.StatusUnauthorized}, nil, nil
 	}
 	// Оператор подключается сразу после захвата, клиент публикует экран чуть позже.
@@ -105,7 +105,7 @@ func waitFor[T any](timeout, step time.Duration, lookup func() (T, bool)) (T, bo
 }
 
 func (s *Server) OnAnnounce(ctx *gortsplib.ServerHandlerOnAnnounceCtx) (*base.Response, error) {
-	if err := s.allow(ctx.Conn.NetConn(), ctx.Path); err != nil {
+	if err := s.allow(ctx.Conn.NetConn(), ctx.Path, true); err != nil {
 		return &base.Response{StatusCode: base.StatusUnauthorized}, nil
 	}
 	s.mu.Lock()
@@ -127,11 +127,12 @@ func (s *Server) OnAnnounce(ctx *gortsplib.ServerHandlerOnAnnounceCtx) (*base.Re
 }
 
 func (s *Server) OnSetup(ctx *gortsplib.ServerHandlerOnSetupCtx) (*base.Response, *gortsplib.ServerStream, error) {
-	if ctx.Session.State() == gortsplib.ServerSessionStatePreRecord {
-		return &base.Response{StatusCode: base.StatusOK}, nil, nil
-	}
-	if err := s.allow(ctx.Conn.NetConn(), ctx.Path); err != nil {
+	publishing := ctx.Session.State() == gortsplib.ServerSessionStatePreRecord
+	if err := s.allow(ctx.Conn.NetConn(), ctx.Path, publishing); err != nil {
 		return &base.Response{StatusCode: base.StatusUnauthorized}, nil, nil
+	}
+	if publishing {
+		return &base.Response{StatusCode: base.StatusOK}, nil, nil
 	}
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -142,7 +143,7 @@ func (s *Server) OnSetup(ctx *gortsplib.ServerHandlerOnSetupCtx) (*base.Response
 }
 
 func (s *Server) OnPlay(ctx *gortsplib.ServerHandlerOnPlayCtx) (*base.Response, error) {
-	if err := s.allow(ctx.Conn.NetConn(), ctx.Path); err != nil {
+	if err := s.allow(ctx.Conn.NetConn(), ctx.Path, false); err != nil {
 		return &base.Response{StatusCode: base.StatusUnauthorized}, nil
 	}
 	logx.Info("rtsp play", map[string]any{"path": ctx.Path})
@@ -150,7 +151,7 @@ func (s *Server) OnPlay(ctx *gortsplib.ServerHandlerOnPlayCtx) (*base.Response, 
 }
 
 func (s *Server) OnRecord(ctx *gortsplib.ServerHandlerOnRecordCtx) (*base.Response, error) {
-	if err := s.allow(ctx.Conn.NetConn(), ctx.Path); err != nil {
+	if err := s.allow(ctx.Conn.NetConn(), ctx.Path, true); err != nil {
 		return &base.Response{StatusCode: base.StatusUnauthorized}, nil
 	}
 	ctx.Session.OnPacketRTPAny(func(medi *description.Media, _ format.Format, pkt *rtp.Packet) {
@@ -173,11 +174,13 @@ func (s *Server) OnRecord(ctx *gortsplib.ServerHandlerOnRecordCtx) (*base.Respon
 	return &base.Response{StatusCode: base.StatusOK}, nil
 }
 
-func (s *Server) allow(conn net.Conn, path string) error {
+func (s *Server) allow(conn net.Conn, path string, publishing bool) error {
 	if !loopback(conn.RemoteAddr()) {
 		return session.ErrDenied
 	}
-	return s.sessions.AllowPath(context.Background(), path)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	return s.sessions.AllowPeer(ctx, conn.RemoteAddr(), path, publishing)
 }
 
 func loopback(addr net.Addr) bool {

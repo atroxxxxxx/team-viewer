@@ -1,7 +1,8 @@
 import uuid
 from datetime import datetime, timedelta, timezone
 
-from sqlalchemy import func, select, update
+from sqlalchemy import func, or_, select, update
+from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.orm import Session
 
 from ticket_service.grants import pick_controls, usable
@@ -15,6 +16,7 @@ from ticket_service.models import (
     Plan,
     PlanStep,
     Problem,
+    RelayRevocation,
     Ticket,
     TicketIndex,
 )
@@ -38,8 +40,11 @@ def create_ticket(session: Session, ticket: Ticket) -> None:
     _action(session, ticket.shard_id, ticket.id, str(ticket.account_id), "create_ticket", "applied")
 
 
-def list_queued(session: Session, limit: int = 50) -> list[Ticket]:
-    return list(session.scalars(select(Ticket).where(Ticket.status == "queued").order_by(Ticket.created_at).limit(limit)))
+def list_queued(session: Session, limit: int = 50):
+    note = _handoff_query(Ticket.shard_id, Ticket.id).scalar_subquery()
+    return session.execute(
+        select(Ticket, note).where(Ticket.status == "queued").order_by(Ticket.created_at, Ticket.id).limit(limit)
+    ).all()
 
 
 def token_matches(session: Session, shard_id: int, ticket_id: uuid.UUID, token_hash: str) -> bool:
@@ -63,7 +68,7 @@ def get_ticket(session: Session, shard_id: int, ticket_id: uuid.UUID) -> Ticket:
     return ticket
 
 
-def lock_ticket(session: Session, shard_id: int, ticket_id: uuid.UUID) -> Ticket:
+def lock_ticket(session: Session, shard_id: int, ticket_id: uuid.UUID, *, allow_terminal=False) -> Ticket:
     # Refresh an already loaded row after waiting for another transaction.
     ticket = session.scalar(
         select(Ticket)
@@ -73,7 +78,7 @@ def lock_ticket(session: Session, shard_id: int, ticket_id: uuid.UUID) -> Ticket
     )
     if ticket is None:
         raise NotFound()
-    if ticket.status in ("resolved", "closed"):
+    if not allow_terminal and ticket.status in ("resolved", "closed"):
         raise Conflict()
     return ticket
 
@@ -90,7 +95,8 @@ def claim(session: Session, shard_id: int, ticket_id: uuid.UUID, operator_id: uu
     result = session.execute(
         update(Ticket)
         .where(Ticket.shard_id == shard_id, Ticket.id == ticket_id, Ticket.status == "queued")
-        .values(status="assigned", assignee=operator_id, tunnel_id=tunnel_id)
+        .values(status="assigned", assignee=operator_id, tunnel_id=tunnel_id,
+                media_renew_at=(now or datetime.now(timezone.utc)) + timedelta(seconds=60))
     )
     if result.rowcount == 0:
         raise Conflict()
@@ -124,24 +130,30 @@ def media_secret(ticket: Ticket, role: str) -> str:
     return secret if secret and len(secret) == 64 else ""
 
 
+def _handoff_query(shard_id, ticket_id):
+    return select(ActionLog.detail).where(
+        ActionLog.shard_id == shard_id,
+        ActionLog.ticket_id == ticket_id,
+        ActionLog.intent == OPERATOR_HANDOFF,
+    ).order_by(ActionLog.created_at.desc(), ActionLog.id.desc()).limit(1)
+
+
 def handoff_note(session: Session, shard_id: int, ticket_id: uuid.UUID) -> dict:
-    detail = session.scalar(
-        select(ActionLog.detail).where(
-            ActionLog.shard_id == shard_id,
-            ActionLog.ticket_id == ticket_id,
-            ActionLog.intent == OPERATOR_HANDOFF,
-        ).order_by(ActionLog.created_at.desc()).limit(1)
-    )
+    detail = session.scalar(_handoff_query(shard_id, ticket_id))
     return detail if isinstance(detail, dict) else {}
 
 
-def release_operator(session: Session, shard_id: int, ticket_id: uuid.UUID, now: datetime, kind: str) -> bool:
+def release_operator(session: Session, shard_id: int, ticket_id: uuid.UUID, now: datetime, kind: str,
+                     expected_tunnel: uuid.UUID | None = None, operator_id: uuid.UUID | None = None) -> bool:
     try:
         ticket = lock_ticket(session, shard_id, ticket_id)
     except Conflict:
         return False
     if ticket.status == "queued":
         return False
+    if (expected_tunnel is not None and ticket.tunnel_id != expected_tunnel
+            or operator_id is not None and ticket.assignee != operator_id):
+        raise Conflict()
     _clear_operator(session, shard_id, ticket, now)
     ticket.status = "queued"
     ticket.assignee = None
@@ -151,33 +163,40 @@ def release_operator(session: Session, shard_id: int, ticket_id: uuid.UUID, now:
         intent=OPERATOR_HANDOFF, phase="applied",
         detail={
             "kind": kind,
-            "operator": CRASH_HANDOFF if kind == "crash" else NORMAL_HANDOFF,
-            "client": CLIENT_SWITCH,
+            "operator": {
+                "crash": CRASH_HANDOFF,
+                "relay_expired": "Видеосеанс истёк. Возьмите заявку снова.",
+            }.get(kind, NORMAL_HANDOFF),
+            "client": "Видеосеанс истёк. Жду нового подключения." if kind == "relay_expired" else CLIENT_SWITCH,
         },
     ))
     return True
 
 
-def expire_operators(session: Session, now: datetime) -> list[uuid.UUID]:
-    tickets = list(session.scalars(select(Ticket).where(Ticket.status.notin_(("queued", "resolved", "closed")))))
-    released = []
+def expire_stale_tickets(session: Session, now: datetime, limit: int = 50) -> None:
+    operator_seen = _last_presence(OPERATOR_PRESENCE)
+    client_seen = func.coalesce(_last_presence(PRESENCE), Ticket.created_at)
+    tickets = session.scalars(
+        select(Ticket).where(
+            Ticket.status.notin_(("resolved", "closed")),
+            or_(
+                client_seen <= now - CLIENT_WAIT,
+                (Ticket.status == "awaiting_client") & (_last_confirmation() <= now - CLIENT_WAIT),
+                Ticket.assignee.is_not(None) & (operator_seen <= now - OPERATOR_WAIT),
+            ),
+        ).order_by(Ticket.id).limit(limit).with_for_update(skip_locked=True)
+    ).all()
     for ticket in tickets:
-        if _operator_silent(session, ticket, now) and release_operator(session, ticket.shard_id, ticket.id, now, "crash"):
-            released.append(ticket.id)
-    return released
+        if not expire_ticket(session, ticket.shard_id, ticket.id, now):
+            expire_operator(session, ticket, now)
 
 
-def _operator_silent(session: Session, ticket: Ticket, now: datetime) -> bool:
-    if ticket.assignee is None:
+def expire_operator(session: Session, ticket: Ticket, now: datetime) -> bool:
+    if ticket.assignee is None or ticket.status in ("queued", "resolved", "closed"):
         return False
-    seen = session.scalar(
-        select(ActionLog.created_at).where(
-            ActionLog.shard_id == ticket.shard_id,
-            ActionLog.ticket_id == ticket.id,
-            ActionLog.intent == OPERATOR_PRESENCE,
-        ).order_by(ActionLog.created_at.desc()).limit(1)
-    )
-    return seen is not None and now - seen >= OPERATOR_WAIT
+    seen = session.scalar(_last_presence(OPERATOR_PRESENCE, ticket.shard_id, ticket.id).element)
+    return bool(seen is not None and now - seen >= OPERATOR_WAIT
+                and release_operator(session, ticket.shard_id, ticket.id, now, "crash", ticket.tunnel_id))
 
 
 def _join_operator(session: Session, shard_id: int, ticket_id: uuid.UUID, operator_id: uuid.UUID) -> None:
@@ -197,6 +216,9 @@ def _join_operator(session: Session, shard_id: int, ticket_id: uuid.UUID, operat
 
 
 def _clear_operator(session: Session, shard_id: int, ticket: Ticket, now: datetime) -> None:
+    if ticket.tunnel_id is not None:
+        schedule_revoke(session, ticket.id, ticket.tunnel_id, now)
+    ticket.media_renew_at = None
     ticket.client_media_secret = None
     ticket.operator_media_secret = None
     session.execute(
@@ -339,7 +361,8 @@ def log_blocked(session: Session, shard_id: int, ticket_id: uuid.UUID, actor: st
 
 
 def create_plan(session: Session, shard_id: int, ticket_id: uuid.UUID, problem_id: uuid.UUID | None, steps: list[str]) -> uuid.UUID:
-    lock_ticket(session, shard_id, ticket_id)
+    ticket = lock_ticket(session, shard_id, ticket_id)
+    ticket.steps_revision += 1
     plan_id = uuid.uuid4()
     session.add(Plan(shard_id=shard_id, id=plan_id, ticket_id=ticket_id, problem_id=problem_id))
     # Шаг ссылается на план. План должен уже быть в транзакции, иначе внешний ключ не видит его.
@@ -381,7 +404,8 @@ def observations(session: Session, shard_id: int, ticket_id: uuid.UUID) -> list[
 
 
 def add_observation(session: Session, shard_id: int, ticket_id: uuid.UUID, step_id: uuid.UUID, body: str, announce: bool = False) -> None:
-    lock_ticket(session, shard_id, ticket_id)
+    ticket = lock_ticket(session, shard_id, ticket_id)
+    ticket.steps_revision += 1
     step = session.get(PlanStep, (shard_id, step_id))
     if step is None or step.ticket_id != ticket_id:
         raise NotFound()
@@ -394,7 +418,8 @@ def add_observation(session: Session, shard_id: int, ticket_id: uuid.UUID, step_
 
 
 def complete_step(session: Session, shard_id: int, ticket_id: uuid.UUID, step_id: uuid.UUID, seen: bool, body: str) -> None:
-    lock_ticket(session, shard_id, ticket_id)
+    ticket = lock_ticket(session, shard_id, ticket_id)
+    ticket.steps_revision += 1
     if seen:
         add_observation(session, shard_id, ticket_id, step_id, "вижу на экране: " + body)
         session.flush()
@@ -415,7 +440,8 @@ def complete_step(session: Session, shard_id: int, ticket_id: uuid.UUID, step_id
 
 
 def revise_step(session: Session, shard_id: int, ticket_id: uuid.UUID, step_id: uuid.UUID, body: str) -> None:
-    lock_ticket(session, shard_id, ticket_id)
+    ticket = lock_ticket(session, shard_id, ticket_id)
+    ticket.steps_revision += 1
     step = session.get(PlanStep, (shard_id, step_id))
     if step is None or step.ticket_id != ticket_id or step.status != "todo":
         raise Conflict()
@@ -560,7 +586,7 @@ def touch_client(session: Session, shard_id: int, ticket_id: uuid.UUID, now: dat
 
 def expire_ticket(session: Session, shard_id: int, ticket_id: uuid.UUID, now: datetime) -> bool:
     ticket = session.get(Ticket, (shard_id, ticket_id))
-    if ticket is None or ticket.status in ("resolved", "closed") or not _client_gone(session, shard_id, ticket, now):
+    if ticket is None or ticket.status in ("resolved", "closed") or not _client_gone(session, ticket, now):
         return False
     try:
         ticket = lock_ticket(session, shard_id, ticket_id)
@@ -575,36 +601,35 @@ def expire_ticket(session: Session, shard_id: int, ticket_id: uuid.UUID, now: da
     return True
 
 
-def expire_open(session: Session, now: datetime) -> list[uuid.UUID]:
-    tickets = list(session.scalars(select(Ticket).where(Ticket.status.notin_(("resolved", "closed")))))
-    return [ticket.id for ticket in tickets if expire_ticket(session, ticket.shard_id, ticket.id, now)]
+def _last_presence(intent, shard_id=Ticket.shard_id, ticket_id=Ticket.id):
+    return select(func.max(ActionLog.created_at)).where(
+        ActionLog.shard_id == shard_id,
+        ActionLog.ticket_id == ticket_id,
+        ActionLog.intent == intent,
+    ).scalar_subquery()
 
 
-def _client_gone(session: Session, shard_id: int, ticket: Ticket, now: datetime) -> bool:
+def _last_confirmation(shard_id=Ticket.shard_id, ticket_id=Ticket.id):
+    return select(func.max(Confirmation.created_at)).where(
+        Confirmation.shard_id == shard_id,
+        Confirmation.ticket_id == ticket_id,
+        Confirmation.accept.is_(True),
+    ).scalar_subquery()
+
+
+def _client_gone(session: Session, ticket: Ticket, now: datetime) -> bool:
     if ticket.status == "awaiting_client":
-        started = session.scalar(
-            select(Confirmation.created_at)
-            .where(
-                Confirmation.shard_id == shard_id,
-                Confirmation.ticket_id == ticket.id,
-                Confirmation.accept.is_(True),
-            )
-            .order_by(Confirmation.created_at.desc())
-            .limit(1)
-        )
+        started = session.scalar(_last_confirmation(ticket.shard_id, ticket.id).element)
         if started is not None and now - started >= CLIENT_WAIT:
             return True
-    seen = session.scalar(
-        select(ActionLog.created_at)
-        .where(
-            ActionLog.shard_id == shard_id,
-            ActionLog.ticket_id == ticket.id,
-            ActionLog.intent == PRESENCE,
-        )
-        .order_by(ActionLog.created_at.desc())
-        .limit(1)
-    )
-    return seen is not None and now - seen >= CLIENT_WAIT
+    seen = session.scalar(_last_presence(PRESENCE, ticket.shard_id, ticket.id).element) or ticket.created_at
+    return now - seen >= CLIENT_WAIT
+
+
+def schedule_revoke(session: Session, ticket_id: uuid.UUID, tunnel_id: uuid.UUID, now: datetime) -> None:
+    session.execute(insert(RelayRevocation).values(
+        ticket_id=ticket_id, tunnel_id=tunnel_id, retry_at=now,
+    ).on_conflict_do_nothing())
 
 
 def _next_position(session: Session, shard_id: int, ticket_id: uuid.UUID) -> int:

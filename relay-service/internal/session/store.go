@@ -4,10 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"strings"
 	"time"
 
-	"github.com/google/uuid"
 	"github.com/redis/go-redis/v9"
 )
 
@@ -25,7 +23,8 @@ type Tunnel struct {
 }
 
 type Store struct {
-	rdb *redis.Client
+	rdb   *redis.Client
+	peers mediaPeers
 }
 
 func Open(addr string) *Store {
@@ -60,7 +59,10 @@ func (s *Store) ByClient(ctx context.Context, clientID string) (Tunnel, error) {
 func (s *Store) ByTunnel(ctx context.Context, tunnelID string) (Tunnel, error) {
 	raw, err := s.rdb.Get(ctx, "tunnel:"+tunnelID).Bytes()
 	if err != nil {
-		return Tunnel{}, ErrDenied
+		if errors.Is(err, redis.Nil) {
+			return Tunnel{}, ErrDenied
+		}
+		return Tunnel{}, err
 	}
 	var item Tunnel
 	if err := json.Unmarshal(raw, &item); err != nil {
@@ -77,42 +79,53 @@ func (s *Store) DeleteByTicket(ctx context.Context, ticketID string) error {
 	if err != nil {
 		return err
 	}
+	return s.DeleteTunnel(ctx, ticketID, tunnelID)
+}
+
+func (s *Store) DeleteTunnel(ctx context.Context, ticketID, tunnelID string) error {
 	item, err := s.ByTunnel(ctx, tunnelID)
-	if err != nil {
-		return s.rdb.Del(ctx, "ticket:"+ticketID, "tunnel:"+tunnelID).Err()
+	if errors.Is(err, ErrDenied) {
+		return nil
 	}
-	// client: хранит последний туннель этого клиента. Закрытие старой заявки не должно стереть новый.
+	if err != nil {
+		return err
+	}
+	if item.TicketID != ticketID {
+		return ErrDenied
+	}
 	_, err = s.rdb.Eval(ctx, `
-		redis.call("DEL", KEYS[1], KEYS[2])
-		if redis.call("GET", KEYS[3]) == ARGV[1] then
-			redis.call("DEL", KEYS[3])
+		redis.call("DEL", KEYS[1])
+		for i = 2, #KEYS do
+			if redis.call("GET", KEYS[i]) == ARGV[1] then
+				redis.call("DEL", KEYS[i])
+			end
 		end
 		return 1
-	`, []string{"ticket:" + ticketID, "tunnel:" + tunnelID, "client:" + item.ClientID}, tunnelID).Result()
+	`, []string{"tunnel:" + tunnelID, "ticket:" + ticketID, "client:" + item.ClientID}, tunnelID).Result()
 	return err
 }
 
-func (s *Store) AllowPath(ctx context.Context, path string) error {
-	parts := strings.Split(strings.Trim(path, "/"), "/")
-	if len(parts) != 3 || parts[0] != "tunnels" {
-		return ErrDenied
-	}
-	if _, err := uuid.Parse(parts[1]); err != nil {
-		return ErrDenied
-	}
-	item, err := s.ByTunnel(ctx, parts[1])
+func (s *Store) RenewTunnel(ctx context.Context, ticketID, tunnelID string) error {
+	item, err := s.ByTunnel(ctx, tunnelID)
 	if err != nil {
+		return err
+	}
+	if item.TicketID != ticketID {
 		return ErrDenied
 	}
-	switch parts[2] {
-	case "screen":
-		return nil
-	case "camera":
-		if !item.Camera {
-			return ErrDenied
-		}
-		return nil
-	default:
+	ok, err := s.rdb.Eval(ctx, `
+		if redis.call("EXISTS", KEYS[1]) == 0 or redis.call("GET", KEYS[2]) ~= ARGV[1] then
+			return 0
+		end
+		redis.call("PEXPIRE", KEYS[1], ARGV[2])
+		redis.call("PEXPIRE", KEYS[2], ARGV[2])
+		if redis.call("GET", KEYS[3]) == ARGV[1] then
+			redis.call("PEXPIRE", KEYS[3], ARGV[2])
+		end
+		return 1
+	`, []string{"tunnel:" + tunnelID, "ticket:" + ticketID, "client:" + item.ClientID}, tunnelID, TTL.Milliseconds()).Int()
+	if err == nil && ok == 0 {
 		return ErrDenied
 	}
+	return err
 }

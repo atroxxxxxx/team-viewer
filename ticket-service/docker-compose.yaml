@@ -50,7 +50,8 @@ services:
       CLIENT_USER: client
       CLIENT_PASSWORD: ${CLIENT_PASSWORD:?Set CLIENT_PASSWORD}
       OPERATOR_USER: operator
-      OPERATOR_PASSWORD: ${OPERATOR_PASSWORD:?Set OPERATOR_PASSWORD}
+      OPERATOR_PASSWORD: ${OPERATOR_PASSWORD:-}
+      OPERATOR_ACCOUNTS_JSON: ${OPERATOR_ACCOUNTS_JSON:-}
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:18080/health')"]
       interval: 2s

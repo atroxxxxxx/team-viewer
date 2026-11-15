@@ -53,11 +53,21 @@ CREATE TABLE tickets (
     tunnel_id uuid,
     client_media_secret text,
     operator_media_secret text,
+    media_renew_at timestamptz,
+    steps_revision integer NOT NULL DEFAULT 0,
     created_at timestamptz NOT NULL DEFAULT now(),
     PRIMARY KEY (shard_id, id)
 ) PARTITION BY LIST (shard_id);
 CALL attach_shards('tickets'::regclass);
 CREATE INDEX tickets_status_created_idx ON tickets (status, created_at DESC);
+
+CREATE TABLE relay_revocations (
+    tunnel_id uuid PRIMARY KEY,
+    ticket_id uuid NOT NULL,
+    retry_at timestamptz NOT NULL
+);
+CREATE INDEX relay_revocations_retry_idx ON relay_revocations (retry_at);
+CREATE INDEX tickets_media_renew_idx ON tickets (media_renew_at) WHERE tunnel_id IS NOT NULL;
 
 CREATE TABLE action_log (
     shard_id smallint NOT NULL,
@@ -144,6 +154,8 @@ CREATE TABLE chat_messages (
     FOREIGN KEY (shard_id, ticket_id) REFERENCES tickets (shard_id, id)
 ) PARTITION BY LIST (shard_id);
 CALL attach_shards('chat_messages'::regclass);
+CREATE INDEX chat_by_ticket_idx ON chat_messages (shard_id, ticket_id, created_at);
+CREATE INDEX action_by_ticket_intent_idx ON action_log (shard_id, ticket_id, intent, created_at DESC);
 
 CREATE TABLE chat_members (
     shard_id smallint NOT NULL,

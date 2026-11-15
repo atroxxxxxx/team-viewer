@@ -70,8 +70,8 @@ func (*testTunnelLookup) ByClient(context.Context, string) (Tunnel, error) {
 	return Tunnel{TunnelID: "test", OperatorSecret: strings.Repeat("a", 64)}, nil
 }
 
-func (s *testTunnelLookup) ByTunnel(context.Context, string) (Tunnel, error) {
-	if s.revoked.Load() {
+func (s *testTunnelLookup) ByTunnel(_ context.Context, id string) (Tunnel, error) {
+	if id != "test" || s.revoked.Load() {
 		return Tunnel{}, ErrDenied
 	}
 	return Tunnel{TunnelID: "test"}, nil

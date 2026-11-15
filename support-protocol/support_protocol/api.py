@@ -1,6 +1,7 @@
 import logging
 import threading
 import time
+from copy import copy
 
 import httpx
 
@@ -16,10 +17,17 @@ class TicketAPI:
         self.password = password
         self.verify = verify
         self.ticket_token = ""
-        self._chat_cache = ("", [])
+        self.assignment_id = ""
+        self._session_cache = ("", [], -1, [])
         self._log_lock = threading.Lock()
         self._last_error = None
         self._last_error_at = 0.0
+
+    def for_assignment(self, assignment_id: str):
+        api = copy(self)
+        api.assignment_id = assignment_id
+        api._session_cache = ("", [], -1, [])
+        return api
 
     def _url(self, path: str) -> str:
         return self.base + path
@@ -34,11 +42,19 @@ class TicketAPI:
         return self._json("POST", f"/api/v1/tickets/{ticket_id}/claim", {})
 
     def session(self, ticket_id: str) -> dict:
-        cached_id, cached_messages = self._chat_cache
-        known = len(cached_messages) if cached_id == ticket_id else -1
-        result = self._json("GET", f"/api/v1/tickets/{ticket_id}/session?known_messages={known}")
-        messages = result.setdefault("messages", cached_messages if cached_id == ticket_id else [])
-        self._chat_cache = ("", []) if (result.get("ticket") or {}).get("status") in {"resolved", "closed"} else (ticket_id, messages)
+        cached_id, messages, revision, steps = self._session_cache
+        if cached_id != ticket_id:
+            messages, revision, steps = [], -1, []
+            known = -1
+        else:
+            known = len(messages)
+        result = self._json("GET", f"/api/v1/tickets/{ticket_id}/session?known_messages={known}&known_steps={revision}")
+        messages = result.setdefault("messages", messages)
+        steps = result.setdefault("steps", steps)
+        if result.get("owned") is False or (result.get("ticket") or {}).get("status") in {"resolved", "closed"}:
+            self._session_cache = ("", [], -1, [])
+        else:
+            self._session_cache = (ticket_id, messages, result.get("steps_revision", -1), steps)
         return result
 
     def message(self, ticket_id: str, author: str, body: str) -> dict:
@@ -114,6 +130,8 @@ class TicketAPI:
 
     def _json(self, method: str, path: str, body: dict | None = None, timeout: float | None = None) -> dict:
         headers = {}
+        if self.assignment_id:
+            headers["X-Support-Tunnel"] = self.assignment_id
         if self.ticket_token:
             headers["X-Ticket-Token"] = self.ticket_token
         try:

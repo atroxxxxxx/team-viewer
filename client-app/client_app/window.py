@@ -5,6 +5,7 @@ import logging
 from pathlib import Path
 from collections import deque
 
+from client_app.capture import read_capture_geometry
 from client_app.input_session import InputSession
 
 from PyQt5.QtCore import QProcess, QTimer, Qt
@@ -26,7 +27,7 @@ from support_protocol.ui import Background, STYLE, ask_yes_no, connection_settin
 from support_protocol.settings import UserSettings
 from support_protocol.api import TicketAPI
 from support_protocol.endpoints import config_file, load_endpoints
-from support_protocol.media import FRAME_HEIGHT, FRAME_WIDTH, DEFAULT_FPS, media_action, publish_args, session_ended
+from support_protocol.media import FRAME_HEIGHT, FRAME_WIDTH, DEFAULT_FPS, CaptureGeometry, media_action, publish_args, session_ended
 from support_protocol.policy import validate_input
 from support_protocol.tunnel import LocalRTSPBridge
 
@@ -52,7 +53,6 @@ class ClientWindow(QWidget, Background):
         self.tunnel_id = ""
         self.media_gen = 0
         self._starting = False
-        self.screen_failed = False
         self.next_start = 0.0
         self.bridge: LocalRTSPBridge | None = None
         self.media_secret = ""
@@ -64,7 +64,8 @@ class ClientWindow(QWidget, Background):
         self._input_busy = False
         self._control = {}
         self.procs: list[QProcess] = []
-        self.scale = 1
+        self.capture_geometry: CaptureGeometry | None = None
+        self._capture_tunnel = ""
         self.init_background()
         self._polling = False
         self._creating = False
@@ -214,7 +215,6 @@ class ClientWindow(QWidget, Background):
             self._input_session = InputSession()
             self.ticket_id = created["ticket_id"]
             self.api.ticket_token = created["ticket_token"]
-            self.scale = 2
             self.status.setText(f"Заявка {self.ticket_id} ждёт оператора")
             self._update_actions()
         def failed(error):
@@ -225,65 +225,78 @@ class ClientWindow(QWidget, Background):
     def _publish(self, mode: str, url: str, gen: int, role: str) -> QProcess | None:
         try:
             args = publish_args(url, mode, os.environ.get("DISPLAY", ":0"),
-                                fps=self.settings.get("video_fps", DEFAULT_FPS), crf=self.settings.get("video_crf", 23))
+                                fps=self.settings.get("video_fps", DEFAULT_FPS), crf=self.settings.get("video_crf", 23),
+                                capture=self.capture_geometry)
         except RuntimeError as exc:
             self.status.setText(str(exc))
             return None
         proc = QProcess(self)
+        proc.stderr_tail = b""
+        proc.readyReadStandardError.connect(lambda p=proc: self._read_publish_error(p))
+        proc.readyReadStandardOutput.connect(proc.readAllStandardOutput)
         proc.finished.connect(lambda *_args, g=gen, r=role, p=proc: self._on_publish_exit(g, r, p))
         proc.errorOccurred.connect(lambda _error, g=gen, r=role, p=proc: self._on_publish_exit(g, r, p))
         self.procs.append(proc)
         proc.start(args[0], args[1:])
         return proc
 
+    @staticmethod
+    def _read_publish_error(proc):
+        proc.stderr_tail = (proc.stderr_tail + bytes(proc.readAllStandardError()))[-8192:]
+
     def _on_publish_exit(self, gen: int, role: str, proc: QProcess) -> None:
         if gen != self.media_gen or proc not in self.procs:
             return
         self.procs.remove(proc)
-        err = bytes(proc.readAllStandardError()).decode("utf-8", errors="replace").strip()
+        self._read_publish_error(proc)
+        err = proc.stderr_tail.decode("utf-8", errors="replace").strip()
         proc.deleteLater()
         if err:
             log.error("FFmpeg %s stopped: %s", role, err)
         if role != "screen":
             self.status.setText("Камера недоступна")
             return
-        if not self.tunnel_id:
-            self.screen_failed = True
         self.next_start = time.monotonic() + 2
         self.stop_media()
         self.status.setText("Передача экрана прервана. Повторное подключение...")
 
-    def _start_tunnel(self, account_id: str, tunnel_id: str, camera: bool) -> None:
-        self._starting = True
+    def _start_tunnel(self, tunnel_id: str, camera: bool) -> None:
         self.stop_media()
-        gen = self.media_gen
-        if len(self.media_secret) != 64:
-            self.screen_failed = True
-            self.next_start = time.monotonic() + 2
-            self.status.setText("Нет ключа сессии")
-            self._starting = False
-            return
-        try:
-            self.bridge = LocalRTSPBridge(self.relay_host, self.relay_port, "CLIENT", account_id, self.media_secret)
-            screen = self.bridge.url(f"/tunnels/{tunnel_id}/screen")
-            screen_proc = self._publish("screen", screen, gen, "screen")
-            if screen_proc is None:
-                self.screen_failed = True
-                self.next_start = time.monotonic() + 2
-                self.stop_media()
-                self.status.setText("Не удалось запустить публикацию экрана")
+        self._starting = True
+        self._capture_tunnel = tunnel_id
+        generation = self.media_gen
+
+        def failed(error):
+            if generation != self.media_gen:
                 return
-            camera_unavailable = False
-            if camera:
-                camera_url = self.bridge.url(f"/tunnels/{tunnel_id}/camera")
-                if os.path.exists("/dev/video0"):
-                    self._publish("camera", camera_url, gen, "camera")
-                else:
-                    camera_unavailable = True
-            self.tunnel_id = tunnel_id
-            self.status.setText("Запуск передачи экрана. Камера недоступна" if camera_unavailable else "Запуск передачи экрана")
-        finally:
-            self._starting = False
+            log.warning("Cannot start X11 capture", exc_info=(type(error), error, error.__traceback__))
+            self.stop_media()
+            self.next_start = time.monotonic() + 2
+            self.status.setText("Не удалось запустить захват экрана X11")
+
+        def geometry_ready(geometry):
+            if generation != self.media_gen:
+                return
+            try:
+                self.capture_geometry = geometry
+                self.bridge = LocalRTSPBridge(self.relay_host, self.relay_port, "CLIENT", tunnel_id, self.media_secret)
+                screen = self.bridge.url(f"/tunnels/{tunnel_id}/screen")
+                if self._publish("screen", screen, generation, "screen") is None:
+                    self.stop_media()
+                    self.next_start = time.monotonic() + 2
+                    return
+                self.tunnel_id = tunnel_id
+                camera_available = camera and os.path.exists("/dev/video0")
+                if camera_available:
+                    self._publish("camera", self.bridge.url(f"/tunnels/{tunnel_id}/camera"), generation, "camera")
+                self.status.setText("Запуск передачи экрана. Камера недоступна"
+                                    if camera and not camera_available else "Запуск передачи экрана")
+            except (OSError, ValueError) as error:
+                failed(error)
+            finally:
+                self._starting = False
+
+        self.run_background(read_capture_geometry, geometry_ready, failed)
 
     def refresh(self) -> None:
         if self._closing or self._editing_settings or self._polling:
@@ -325,13 +338,15 @@ class ClientWindow(QWidget, Background):
             return
         self.media_secret = str(session.get("media_secret") or "")
         self._client_notice = str((session.get("handoff") or {}).get("client") or "") if status == "queued" else ""
+        if self._starting and self._capture_tunnel != tunnel_id:
+            self.stop_media()
         if not self._starting:
             action = media_action(self.tunnel_id, tunnel_id, status)
             if action == "stop":
                 self.stop_media()
                 self._show_status(status)
             elif action == "start" and len(self.media_secret) == 64 and time.monotonic() >= self.next_start:
-                self._start_tunnel(ticket.get("account_id") or self.account_id, tunnel_id, bool(ticket.get("camera")))
+                self._start_tunnel(tunnel_id, bool(ticket.get("camera")))
             elif self.bridge is None:
                 self._show_status(status)
         sync_chat(self.chat, session.get("messages") or [])
@@ -463,9 +478,10 @@ class ClientWindow(QWidget, Background):
         if kind == "pointer":
             pointer = event.get("pointer") or {}
             x, y = int(pointer["x"]), int(pointer["y"])
-            if not (0 <= x <= 10000 and 0 <= y <= 10000):
-                return "координаты отклонены"
-            args = [xdotool, "mousemove", str(x * self.scale), str(y * self.scale), "click", "1"]
+            point = self.capture_geometry.project(x, y) if self.capture_geometry is not None else None
+            if point is None:
+                return "указатель вне области захвата"
+            args = [xdotool, "mousemove", str(point[0]), str(point[1]), "click", "1"]
         elif kind == "text":
             text = str(event.get("text") or "")
             if not text or any(ord(ch) < 32 or ord(ch) == 127 for ch in text):
@@ -618,6 +634,9 @@ class ClientWindow(QWidget, Background):
             self.run_background(call)
     def stop_media(self) -> None:
         self.media_gen += 1
+        self._starting = False
+        self._capture_tunnel = ""
+        self.capture_geometry = None
         self.tunnel_id = ""
         for proc in self.procs:
             if proc.state() == QProcess.NotRunning:

@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"crypto/subtle"
 	"crypto/tls"
+	"errors"
 	"io"
 	"net"
 	"strings"
@@ -22,6 +23,7 @@ type Bridge struct {
 	addr     string
 	rtspAddr string
 	store    tunnelLookup
+	peers    *mediaPeers
 	TLS      *tls.Config
 }
 
@@ -31,7 +33,7 @@ type tunnelLookup interface {
 }
 
 func NewBridge(addr, rtspAddr string, store *Store) *Bridge {
-	return &Bridge{addr: addr, rtspAddr: rtspAddr, store: store}
+	return &Bridge{addr: addr, rtspAddr: rtspAddr, store: store, peers: &store.peers}
 }
 
 func (b *Bridge) Serve(ctx context.Context) error {
@@ -63,12 +65,18 @@ func (b *Bridge) handle(ctx context.Context, front net.Conn) {
 	defer front.Close()
 	_ = front.SetDeadline(time.Now().Add(5 * time.Second))
 	reader := bufio.NewReaderSize(front, maxHelloBytes)
-	role, clientID, secret, ok := readHello(reader)
+	role, identifier, secret, ok := readHello(reader)
 	if !ok {
 		return
 	}
 	_ = front.SetDeadline(time.Time{})
-	item, err := b.store.ByClient(ctx, clientID)
+	lookup, cancel := context.WithTimeout(ctx, time.Second)
+	item, err := b.store.ByTunnel(lookup, identifier)
+	if errors.Is(err, ErrDenied) {
+		// Older GUIs send the device UUID rather than the tunnel UUID.
+		item, err = b.store.ByClient(lookup, identifier)
+	}
+	cancel()
 	if err != nil || !item.allows(role, secret) {
 		logx.Info("session denied", map[string]any{"role": role})
 		return
@@ -79,6 +87,10 @@ func (b *Bridge) handle(ctx context.Context, front net.Conn) {
 		return
 	}
 	defer back.Close()
+	if b.peers != nil {
+		unbind := b.peers.bind(back.LocalAddr(), item, role)
+		defer unbind()
+	}
 	logx.Info("session joined", map[string]any{"role": role, "tunnel_id": item.TunnelID})
 	done := make(chan struct{}, 2)
 	go func() {

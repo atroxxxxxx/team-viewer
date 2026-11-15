@@ -36,7 +36,16 @@ class Ticket(Base):
     tunnel_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
     client_media_secret: Mapped[str | None] = mapped_column(Text)
     operator_media_secret: Mapped[str | None] = mapped_column(Text)
+    steps_revision: Mapped[int] = mapped_column(Integer, server_default="0")
+    media_renew_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+
+
+class RelayRevocation(Base):
+    __tablename__ = "relay_revocations"
+    tunnel_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True)
+    ticket_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True))
+    retry_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
 
 
 class ActionLog(Base):

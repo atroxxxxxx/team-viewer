@@ -65,6 +65,33 @@ def ensure_tunnel_access(factory) -> None:
         """))
 
 
+def ensure_relay_maintenance(factory) -> None:
+    with factory.begin() as session:
+        session.execute(text("""
+            ALTER TABLE tickets ADD COLUMN IF NOT EXISTS media_renew_at timestamptz,
+                ADD COLUMN IF NOT EXISTS steps_revision integer NOT NULL DEFAULT 0
+        """))
+        session.execute(text("""
+            CREATE INDEX IF NOT EXISTS chat_by_ticket_idx ON chat_messages (shard_id, ticket_id, created_at)
+        """))
+        session.execute(text("""
+            CREATE INDEX IF NOT EXISTS action_by_ticket_intent_idx
+                ON action_log (shard_id, ticket_id, intent, created_at DESC)
+        """))
+        session.execute(text("""
+            CREATE TABLE IF NOT EXISTS relay_revocations (
+                tunnel_id uuid PRIMARY KEY,
+                ticket_id uuid NOT NULL,
+                retry_at timestamptz NOT NULL
+            )
+        """))
+        session.execute(text("CREATE INDEX IF NOT EXISTS relay_revocations_retry_idx ON relay_revocations (retry_at)"))
+        session.execute(text("""
+            CREATE INDEX IF NOT EXISTS tickets_media_renew_idx
+                ON tickets (media_renew_at) WHERE tunnel_id IS NOT NULL
+        """))
+
+
 def local_shard_count(factory) -> int:
     with factory() as session:
         from ticket_service.models import ShardDirectory

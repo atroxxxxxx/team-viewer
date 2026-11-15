@@ -31,10 +31,23 @@ class Relay:
             raise RuntimeError("ретранслятор не выдал секреты сессии")
         return OpenedTunnel(uuid.UUID(body["tunnel_id"]), client_secret, operator_secret)
 
-    def close(self, ticket_id: uuid.UUID) -> None:
+    def close(self, ticket_id: uuid.UUID, tunnel_id: uuid.UUID) -> None:
         response = self.http.delete(
             self.base + "/api/v1/tunnels/" + str(ticket_id),
+            params={"tunnel_id": str(tunnel_id)},
             headers={"Authorization": "Bearer " + self.token},
         )
         if response.status_code not in (204, 404):
             raise RuntimeError(f"ретранслятор ответил {response.status_code}")
+
+    def renew(self, ticket_id: uuid.UUID, tunnel_id: uuid.UUID) -> bool:
+        response = self.http.post(
+            self.base + f"/api/v1/tunnels/{ticket_id}/renew",
+            params={"tunnel_id": str(tunnel_id)},
+            headers={"Authorization": "Bearer " + self.token},
+        )
+        if response.status_code == 404:
+            return False
+        if response.status_code != 204:
+            raise RuntimeError(f"ретранслятор ответил {response.status_code}")
+        return True

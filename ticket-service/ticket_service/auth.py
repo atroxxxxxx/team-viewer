@@ -13,22 +13,29 @@ class Principal:
 
 
 class Checker:
-    def __init__(self, client_user: str, client_pass: str, operator_user: str, operator_pass: str):
-        if not all((client_user, client_pass, operator_user, operator_pass)):
-            raise ValueError("пустые учётные данные")
-        if client_user == operator_user:
+    def __init__(self, client_user: str, client_pass: str, operator_user: str, operator_pass: str,
+                 operator_accounts: dict[str, str] | None = None):
+        if not (client_user and client_pass):
+            raise ValueError("пустые учётные данные клиента")
+        self.operators = dict(operator_accounts or {})
+        if operator_user and operator_pass:
+            if operator_user in self.operators:
+                raise ValueError("повторяющийся логин оператора")
+            self.operators[operator_user] = operator_pass
+        if not self.operators or any(not user or not password or ":" in user for user, password in self.operators.items()):
+            raise ValueError("нужны отдельные логины и пароли операторов")
+        if client_user in self.operators:
             raise ValueError("логины клиента и оператора совпадают")
         self.client_user = client_user
         self.client_pass = client_pass
-        self.operator_user = operator_user
-        self.operator_pass = operator_pass
-        self.operator_id = uuid.uuid5(NAMESPACE_OID, "support-operator:" + operator_user)
 
     def authenticate(self, user: str, password: str) -> Principal | None:
         if _match(user, password, self.client_user, self.client_pass):
             return Principal("client", self.client_user)
-        if _match(user, password, self.operator_user, self.operator_pass):
-            return Principal("operator", self.operator_user, self.operator_id)
+        secret = self.operators.get(user)
+        if secret is not None and _match(user, password, user, secret):
+            operator_id = uuid.uuid5(NAMESPACE_OID, "support-operator:" + user)
+            return Principal("operator", user, operator_id)
         return None
 
 

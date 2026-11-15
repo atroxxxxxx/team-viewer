@@ -1,3 +1,4 @@
+import json
 import os
 import time
 
@@ -5,17 +6,21 @@ import uvicorn
 
 from ticket_service.app import build_app
 from ticket_service.auth import Checker
-from ticket_service.db import engine_from_url, ensure_step_order, ensure_tunnel_access, local_shard_count, session_factory
+from ticket_service.db import engine_from_url, ensure_relay_maintenance, ensure_step_order, ensure_tunnel_access, local_shard_count, session_factory
 from ticket_service.log import error, info
 from ticket_service.relay import Relay
 
 
 def main() -> None:
+    operators = json.loads(_env("OPERATOR_ACCOUNTS_JSON", "{}"))
+    if not isinstance(operators, dict) or not all(isinstance(p, str) for p in operators.values()):
+        raise ValueError("OPERATOR_ACCOUNTS_JSON должен содержать логины и пароли операторов")
     creds = Checker(
         _env("CLIENT_USER", ""),
         _env("CLIENT_PASSWORD", ""),
         _env("OPERATOR_USER", ""),
         _env("OPERATOR_PASSWORD", ""),
+        operators,
     )
     shard_count = int(_env("SHARD_COUNT", "4"))
     if shard_count <= 0:
@@ -24,6 +29,7 @@ def main() -> None:
     factory = _wait_db(_env("DATABASE_URL", "postgres://support:support@127.0.0.1:5432/support?sslmode=disable"), shard_count)
     ensure_step_order(factory)
     ensure_tunnel_access(factory)
+    ensure_relay_maintenance(factory)
     app = build_app(
         factory,
         creds,

@@ -1,11 +1,44 @@
 import re
 import shutil
+from dataclasses import dataclass
 
 _DISPLAY = re.compile(r"^:[0-9]{1,2}(?:\.[0-9]{1,2})?$")
 
 FRAME_WIDTH = 640
 FRAME_HEIGHT = 360
 DEFAULT_FPS = 60
+
+
+@dataclass(frozen=True)
+class CaptureGeometry:
+    width: int
+    height: int
+
+    def __post_init__(self):
+        if self.width <= 0 or self.height <= 0:
+            raise ValueError("некорректный размер экрана")
+
+    def content_area(self) -> tuple[int, int, int, int]:
+        ratio = min(FRAME_WIDTH / self.width, FRAME_HEIGHT / self.height)
+        width = max(2, int(self.width * ratio) // 2 * 2)
+        height = max(2, int(self.height * ratio) // 2 * 2)
+        left = (FRAME_WIDTH - width) // 4 * 2
+        top = (FRAME_HEIGHT - height) // 4 * 2
+        return left, top, width, height
+
+    def project(self, x: int, y: int) -> tuple[int, int] | None:
+        left, top, width, height = self.content_area()
+        if not (left <= x < left + width and top <= y < top + height):
+            return None
+        return (x - left) * self.width // width, (y - top) * self.height // height
+
+    def filter(self) -> str:
+        left, top, width, height = self.content_area()
+        return f"scale={width}:{height},pad={FRAME_WIDTH}:{FRAME_HEIGHT}:{left}:{top}:black"
+
+
+def x11_display(value: str) -> str:
+    return value if _DISPLAY.fullmatch(value) else ":0"
 
 
 def ffmpeg_path() -> str:
@@ -19,7 +52,8 @@ def valid_fps(value) -> bool:
     return type(value) is int and value > 0
 
 
-def publish_args(url: str, mode: str, display: str, *, fps: int = DEFAULT_FPS, crf: int = 23) -> list[str]:
+def publish_args(url: str, mode: str, display: str, *, fps: int = DEFAULT_FPS, crf: int = 23,
+                 capture: CaptureGeometry | None = None) -> list[str]:
     if not valid_fps(fps) or not 18 <= crf <= 35:
         raise ValueError("unsupported video settings")
     ffmpeg = ffmpeg_path()
@@ -31,10 +65,11 @@ def publish_args(url: str, mode: str, display: str, *, fps: int = DEFAULT_FPS, c
         "-flush_packets", "1", "-f", "rtsp", "-rtsp_transport", "tcp", url,
     ]
     if mode == "screen":
+        geometry = capture or CaptureGeometry(1280, 720)
         return [
             ffmpeg, "-loglevel", "error", "-f", "x11grab", "-framerate", str(fps),
-            "-video_size", "1280x720", "-i", display if _DISPLAY.fullmatch(display or "") else ":0",
-            "-vf", f"scale={FRAME_WIDTH}:{FRAME_HEIGHT}", *output,
+            "-video_size", f"{geometry.width}x{geometry.height}", "-i", x11_display(display or ""),
+            "-vf", geometry.filter(), *output,
         ]
     if mode == "camera":
         return [

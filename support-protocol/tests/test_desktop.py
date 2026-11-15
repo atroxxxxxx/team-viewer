@@ -33,7 +33,6 @@ def pump(app, predicate, timeout=2):
 def windows(app, monkeypatch, tmp_path):
     monkeypatch.setenv("SUPPORT_SETTINGS_DIR", str(tmp_path))
     monkeypatch.setattr(client_module, "STATE", tmp_path / "client-id")
-    monkeypatch.setattr(operator_module, "STATE", tmp_path / "operator-id")
     monkeypatch.setattr(TicketAPI, "health", lambda self: {"status": "ok"})
     monkeypatch.setattr(TicketAPI, "list_queued", lambda self: [])
     monkeypatch.setattr(TicketAPI, "release", lambda self, ticket_id: {})
@@ -137,7 +136,6 @@ def test_client_outage_recovery_without_changing_settings(app, windows, during_s
 
 def test_operator_down_at_start_and_automatic_recovery(app, monkeypatch, tmp_path):
     monkeypatch.setenv("SUPPORT_SETTINGS_DIR", str(tmp_path))
-    monkeypatch.setattr(operator_module, "STATE", tmp_path / "id")
     def down(_): raise ServiceUnavailable()
     monkeypatch.setattr(TicketAPI, "list_queued", down)
     o = operator_module.OperatorWindow()
@@ -590,6 +588,9 @@ def test_client_publishes_60_after_loading_old_15_profile(app, monkeypatch, tmp_
             def __init__(self, *_):
                 self.finished = SimpleSignal()
                 self.errorOccurred = SimpleSignal()
+                self.readyReadStandardError = SimpleSignal()
+                self.readyReadStandardOutput = SimpleSignal()
+            def readAllStandardOutput(self): return b""
             def start(self, *_): pass
             def kill(self): pass
             def deleteLater(self): pass
@@ -682,3 +683,32 @@ def test_input_result_retries_without_repeating_local_input(app, windows):
     pump(app, lambda: len(acknowledgements) == 2 and not client._input_busy)
     assert len(local_calls) == 1
     assert acknowledgements[0] == acknowledgements[1]
+
+
+def test_publisher_retains_only_stderr_tail(app, windows, monkeypatch):
+    import sys
+
+    client, _ = windows
+    script = "import sys,time; sys.stderr.buffer.write(b'x'*65536); sys.stderr.flush(); time.sleep(2)"
+    monkeypatch.setattr(client_module, "publish_args", lambda *a, **k: [sys.executable, "-c", script])
+    proc = client._publish("screen", "rtsp://localhost/screen", client.media_gen, "screen")
+    try:
+        pump(app, lambda: len(proc.stderr_tail) == 8192)
+        assert proc.stderr_tail == b"x" * 8192
+        assert proc.readAllStandardError().isEmpty()
+    finally:
+        proc.kill()
+        pump(app, lambda: not client.procs)
+
+
+def test_queue_keeps_id_separate_from_description(app, windows):
+    _, operator = windows
+    ticket = "12345678-1234-1234-1234-123456789abc"
+    description = "Экран гаснет при переключении"
+    operator.api.list_queued = lambda: [{"ticket_id": ticket, "description": description}]
+    operator.reload_queue()
+    pump(app, lambda: operator.queue.count() == 1)
+    item = operator.queue.item(0)
+    assert item.text() == description
+    assert item.data(Qt.UserRole) == ticket
+    assert ticket in item.toolTip()
