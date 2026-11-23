@@ -12,4 +12,4 @@
 
 ## ELK
 
-Elasticsearch, Logstash и Kibana сюда не входят. Сервисы пишут JSON в stdout. Срок хранения строк заявки и запас по диску описаны в [отчёте](../README.md#schema).
+Elasticsearch, Logstash и Kibana сюда не входят. Сервисы пишут JSON в stdout. Срок хранения строк заявки и запас по диску описаны в [README.md](../README.md#schema).

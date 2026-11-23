@@ -73,9 +73,7 @@ class UserSettings:
             if not isinstance(values, dict):
                 raise ValueError("invalid settings values")
             self.values = {k: v for k, v in values.items() if k in VALIDATORS and VALIDATORS[k](v)}
-            # Старые профили сохраняли частоту в пределах 30 FPS.
-            # Обновление убирает это ограничение и применяет новый дефолт.
-            # Любая явно выбранная частота в новом профиле сохраняется.
+            # Профиль старой версии с частотой ниже дефолта поднимается до DEFAULT_FPS.
             migrate_video = (role == "client" and data.get("version", 1) < SETTINGS_VERSION and
                              "video_fps" in self.values and self.values["video_fps"] < DEFAULT_FPS)
         except FileNotFoundError:
